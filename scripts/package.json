@@ -1,0 +1,22 @@
+{
+  "name": "sequential-scripts",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "cli": "tsx src/index.ts",
+    "test": "tsx test/delegate.test.ts"
+  },
+  "dependencies": {
+    "@near-js/crypto": "^1.4.2",
+    "@near-js/transactions": "^1.3.3",
+    "bs58": "^6.0.0",
+    "near-api-js": "^5.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}
