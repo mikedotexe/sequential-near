@@ -103,6 +103,77 @@ export async function getBlockHeight(): Promise<bigint> {
   return BigInt(block.header.height);
 }
 
+export async function viewCall<T = unknown>(
+  accountId: string,
+  methodName: string,
+  args: Record<string, unknown>,
+): Promise<T> {
+  const argsBase64 = Buffer.from(JSON.stringify(args)).toString("base64");
+  const result = await auditRpc<{ result: number[] }>("query", {
+    request_type: "call_function",
+    account_id: accountId,
+    method_name: methodName,
+    args_base64: argsBase64,
+    finality: "final",
+  });
+  const buf = Buffer.from(result.result);
+  return JSON.parse(buf.toString("utf8")) as T;
+}
+
+export interface ReceiptOutcomeEntry {
+  id: string;
+  outcome: {
+    logs: string[];
+    receipt_ids: string[];
+    gas_burnt: number;
+    status:
+      | { SuccessValue: string }
+      | { SuccessReceiptId: string }
+      | { Failure: unknown }
+      | { Unknown: unknown };
+  };
+}
+
+export interface TxStatusResult {
+  status:
+    | { SuccessValue: string }
+    | { Failure: unknown }
+    | { Unknown: unknown };
+  transaction: { hash: string; signer_id: string; receiver_id: string };
+  transaction_outcome: ReceiptOutcomeEntry;
+  receipts_outcome: ReceiptOutcomeEntry[];
+}
+
+export async function txStatus(
+  txHash: string,
+  senderId: string,
+  waitUntil: "NONE" | "INCLUDED" | "EXECUTED_OPTIMISTIC" | "EXECUTED" | "FINAL" = "FINAL",
+): Promise<TxStatusResult> {
+  return auditRpc<TxStatusResult>("EXPERIMENTAL_tx_status", {
+    tx_hash: txHash,
+    sender_account_id: senderId,
+    wait_until: waitUntil,
+  });
+}
+
+/// Parse `trace:{...}` JSON lines from a full tx's receipt DAG.
+export function extractTraceEvents(status: TxStatusResult): Array<Record<string, unknown>> {
+  const events: Array<Record<string, unknown>> = [];
+  const allLogs = [
+    ...(status.transaction_outcome?.outcome?.logs ?? []),
+    ...status.receipts_outcome.flatMap((r) => r.outcome.logs),
+  ];
+  for (const line of allLogs) {
+    if (!line.startsWith("trace:")) continue;
+    try {
+      events.push(JSON.parse(line.slice("trace:".length)) as Record<string, unknown>);
+    } catch {
+      // Non-JSON trace lines are just dropped; the gate emits valid JSON.
+    }
+  }
+  return events;
+}
+
 let _connected: Promise<Near> | null = null;
 export async function connectSender(): Promise<Near> {
   if (_connected) return _connected;
