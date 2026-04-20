@@ -1,6 +1,7 @@
 #!/usr/bin/env tsx
 import { cmdClean } from "./commands/clean.js";
 import { cmdDeploy } from "./commands/deploy.js";
+import { cmdSequence } from "./commands/sequence.js";
 import { cmdSubmit, type SubmitTarget, type SubmitVariant } from "./commands/submit.js";
 
 const HELP = `sequential — signed-intent sequencer workflow
@@ -15,6 +16,10 @@ Commands:
                                  end-to-end single-intent flow
                                  variant: claim | reject | timeout | bad-sig | expired | replay
                                  target:  register (default) | ft-shim
+  sequence --n <N> [--target <t>] [--permutation identity|random|<csv>]
+                                 N-intent chained batch with permutation check
+                                 target:       register (default) | ft-shim
+                                 permutation:  identity (default) | random | comma-separated
 
 Flags:
   --i-know-this-is-testnet       required for \`clean\` on testnet
@@ -64,6 +69,24 @@ async function main(): Promise<void> {
       await cmdSubmit({
         variant: variant as SubmitVariant,
         target: target as SubmitTarget,
+      });
+      break;
+    }
+    case "sequence": {
+      const nStr = parseFlag("n", "3");
+      const n = parseInt(nStr, 10);
+      if (!Number.isFinite(n) || n < 2) {
+        throw new Error(`--n must be an integer >= 2, got ${nStr}`);
+      }
+      const target = parseFlag("target", "register");
+      if (!VALID_TARGETS.includes(target as SubmitTarget)) {
+        throw new Error(`unknown --target: ${target}. valid: ${VALID_TARGETS.join(", ")}`);
+      }
+      const permutation = parseFlag("permutation", "identity");
+      await cmdSequence({
+        n,
+        target: target as SubmitTarget,
+        permutation,
       });
       break;
     }

@@ -6,7 +6,7 @@
   "scripts": {
     "build": "tsc --noEmit",
     "cli": "tsx src/index.ts",
-    "test": "tsx test/delegate.test.ts"
+    "test": "tsx test/delegate.test.ts && tsx test/permutation.test.ts"
   },
   "dependencies": {
     "@near-js/crypto": "^1.4.2",
