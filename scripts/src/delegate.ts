@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { actionCreators } from "@near-js/transactions";
 import {
   buildDelegateAction,
@@ -52,13 +53,23 @@ export function buildFunctionCallDelegate(opts: FunctionCallArgs): DelegateActio
 /// Sign a delegate with the sender's key. Returns the borsh-encoded
 /// SignedDelegate bytes (wire-format-ready) plus the signed-message
 /// hash (useful for debugging / cross-checking the gate's verify).
+///
+/// The custom MessageSigner sha256s the message before signing,
+/// matching what NEAR runtime + near-primitives' verifier expect
+/// (`signature.verify(sha256(prefix || borsh(delegate)), pk)`).
+/// near-api-js's `InMemorySigner.signMessage` does the same hash
+/// step internally; `signDelegateAction` takes a bare `.sign()`
+/// and requires the caller to do the hashing. Missed that on the
+/// first pass — first testnet submit_intent panicked with
+/// "signature verification failed" until this was added.
 export async function signDelegate(
   delegate: DelegateAction,
   signerKey: KeyPair,
 ): Promise<{ encoded: Uint8Array; base64: string; hash: Uint8Array }> {
   const signer = {
     async sign(message: Uint8Array): Promise<Uint8Array> {
-      return signerKey.sign(message).signature;
+      const hash = createHash("sha256").update(message).digest();
+      return signerKey.sign(new Uint8Array(hash)).signature;
     },
   };
   const { signedDelegateAction, hash } = await signDelegateAction({

@@ -1,0 +1,27 @@
+[target.wasm32-unknown-unknown]
+# -C target-cpu=mvp pins the wasm output to the MVP instruction set —
+# no bulk-memory-ops, sign-extension, reference-types, SIMD, etc. NEAR's
+# VM rejects wasm using newer features ("CompilationError::PrepareError::
+# Deserialization"), so we opt out at compile time. rustc's default
+# target-cpu for wasm32-unknown-unknown enables post-MVP features, which
+# is why cargo build without this config produces wasm that testnet
+# refuses to load.
+#
+# -C link-arg=-s strips debug symbols (smaller wasm). --allow-undefined
+# is required so the linker accepts near-sdk's host-function imports
+# (env::input, env::read_register, env::ed25519_verify, etc.) as
+# unresolved at link time; they're resolved by the NEAR runtime at
+# invocation time.
+rustflags = [
+  "-C", "link-arg=-s",
+  "-C", "link-arg=--allow-undefined",
+  "-C", "target-cpu=mvp",
+]
+
+[unstable]
+# Rebuild std from source with the target-cpu=mvp flag applied. Without
+# this, cargo links against the pre-built libstd.rlib that ships with
+# rustup, which was compiled with newer wasm features (bulk-memory, sign-
+# ext, etc.) — NEAR's VM rejects those. Requires nightly (`cargo +nightly`
+# or a nightly-pinned rust-toolchain.toml).
+build-std = ["std", "panic_abort"]

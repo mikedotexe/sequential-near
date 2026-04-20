@@ -14,11 +14,18 @@ Per-gate-deploy (once per network):
 | `alice.<master>` sub-account creation + initial balance | 1 |
 | `relayer.<master>` sub-account | 1 |
 | `approver.<master>` sub-account | 1 |
-| `gate.<master>` sub-account + wasm deploy (~340 KB) + init | 3 |
-| `register.<master>` sub-account + wasm deploy (~150 KB) + init | 3 |
-| `ft.<master>` sub-account + wasm deploy (~195 KB) + init | 3 |
+| `gate.<master>` sub-account + wasm deploy (~376 KB) + init | 5 |
+| `register.<master>` sub-account + wasm deploy (~150 KB) + init | 5 |
+| `ft.<master>` sub-account + wasm deploy (~195 KB) + init | 5 |
 | `add_relayer` whitelist call | negligible (<0.01) |
-| **total one-time bootstrap** | **~12 NEAR** |
+| **total one-time bootstrap** | **~18 NEAR** |
+
+NEAR's storage stake is ~1 NEAR per 100 KB; the gate alone needs
+~3.76 NEAR for wasm storage, so the per-contract 5 NEAR initial
+balance covers storage with comfortable headroom for runtime state
+growth (pending map, used_nonces, etc.). The initial testnet deploy
+was attempted with 3 NEAR and failed with "wouldn't have enough
+balance to cover storage" — 5 NEAR fixed it.
 
 Per-run costs (recoverable from `alice`, `relayer`, `approver` after
 `clean`):

@@ -14,11 +14,7 @@ publish = false
 
 [workspace.dependencies]
 near-sdk = "5.26.1"
-# Pin matches the borsh version inside near-sdk 5.26.1 so the derive
-# macros resolve `::borsh` without needing `#[borsh(crate = ...)]`.
-borsh = { version = "1.6", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 
 [profile.release]
 codegen-units = 1

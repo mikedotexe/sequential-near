@@ -32,9 +32,16 @@ export class RpcError extends Error {
   }
 }
 
+function isTransientRpcError(err: RpcError): boolean {
+  const data = typeof err.data === "string" ? err.data : JSON.stringify(err.data ?? "");
+  const payload = `${err.message} ${data}`.toLowerCase();
+  if (/overload|timeout|too\s+busy|too\s+many\s+requests/.test(payload)) return true;
+  return false;
+}
+
 async function rpcCall<T>(url: string, method: string, params: unknown): Promise<T> {
   const body = JSON.stringify({ jsonrpc: "2.0", id: "sequential", method, params });
-  const maxAttempts = 6;
+  const maxAttempts = 8;
   let lastErr: unknown;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -42,13 +49,20 @@ async function rpcCall<T>(url: string, method: string, params: unknown): Promise
       if (res.status === 429 || res.status >= 500) {
         lastErr = new Error(`HTTP ${res.status}`);
         if (attempt === maxAttempts) break;
-        const backoffMs = Math.min(8000, 250 * 2 ** (attempt - 1));
+        const backoffMs = Math.min(8000, 500 * 2 ** (attempt - 1));
         await new Promise((r) => setTimeout(r, backoffMs));
         continue;
       }
       const json = (await res.json()) as { result?: T; error?: JsonRpcError };
       if (json.error) {
-        throw new RpcError(json.error.code, json.error.message, json.error.data);
+        const rpcErr = new RpcError(json.error.code, json.error.message, json.error.data);
+        if (isTransientRpcError(rpcErr) && attempt < maxAttempts) {
+          lastErr = rpcErr;
+          const backoffMs = Math.min(8000, 500 * 2 ** (attempt - 1));
+          await new Promise((r) => setTimeout(r, backoffMs));
+          continue;
+        }
+        throw rpcErr;
       }
       if (json.result === undefined) {
         throw new Error(`RPC returned no result for ${method}`);
@@ -58,7 +72,7 @@ async function rpcCall<T>(url: string, method: string, params: unknown): Promise
       lastErr = err;
       if (err instanceof RpcError) throw err;
       if (attempt === maxAttempts) break;
-      const backoffMs = Math.min(8000, 250 * 2 ** (attempt - 1));
+      const backoffMs = Math.min(8000, 500 * 2 ** (attempt - 1));
       await new Promise((r) => setTimeout(r, backoffMs));
     }
   }

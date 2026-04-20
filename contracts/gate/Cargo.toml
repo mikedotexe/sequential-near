@@ -10,9 +10,16 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 near-sdk = { workspace = true }
-borsh = { workspace = true }
+# Direct borsh dep (matches near-sdk 5.26.1's transitive version) so
+# derive macros resolve `::borsh` without `#[borsh(crate = ...)]`. Kept
+# per-crate instead of at workspace level because workspace-level borsh
+# interacted badly with the nightly build-std path (produced wasm that
+# failed NEAR VM's prepare step with CompilationError::Deserialization).
+borsh = { version = "1.6", features = ["derive"] }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# serde_json comes in transitively via near-sdk; we don't declare it
+# directly because that also triggered the build-std wasm rejection.
+# All usage goes through near_sdk::serde_json::* reexports.
 
 [dev-dependencies]
 near-sdk = { workspace = true, features = ["unit-testing"] }

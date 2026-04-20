@@ -1,10 +1,16 @@
 [toolchain]
-# Pin stable + wasm32 target so two contributors cloning this repo and
-# running `cargo build --release --target wasm32-unknown-unknown` produce
-# byte-identical wasm. Combined with the committed Cargo.lock this gives
-# reproducible contract builds across machines — important because the
-# gate's signature-verification code path is load-bearing and we want the
-# deployed bytes on testnet and mainnet to be reconstructible from source.
-channel = "stable"
+# Pin nightly (with wasm32 target + rust-src component) because the
+# `.cargo/config.toml` uses `[unstable] build-std = ["std", "panic_abort"]`
+# to rebuild std from source with `target-cpu=mvp`. Without this path, the
+# pre-built libstd.rlib bundled with stable rustc was compiled with post-
+# MVP wasm features (bulk-memory, sign-ext) that NEAR's VM rejects with
+# `CompilationError::Deserialization`. Confirmed experimentally on testnet:
+# stable-built wasm fails to load; nightly + build-std + MVP succeeds.
+#
+# Pinning nightly (unpinned) rather than a dated nightly is the same
+# tradeoff the sibling repo (near-sequencer-demo) accepts via a rustup
+# directory override. Cargo.lock is committed for dep reproducibility.
+channel = "nightly"
 targets = ["wasm32-unknown-unknown"]
+components = ["rust-src"]
 profile = "minimal"
