@@ -28,7 +28,7 @@ was attempted with 3 NEAR and failed with "wouldn't have enough
 balance to cover storage" — 5 NEAR fixed it.
 
 Per-run costs (recoverable from `alice`, `relayer`, `approver` after
-`clean`):
+`clean`) — **gas only**:
 
 | activity | approximate cost (NEAR) |
 |---|---|
@@ -39,7 +39,31 @@ Per-run costs (recoverable from `alice`, `relayer`, `approver` after
 | Dispatched inner FunctionCall (register.set) | 0.001 |
 | Dispatched inner FunctionCall (ft-shim.transfer) | 0.002 |
 
-The ~12-NEAR bootstrap assumes you're comfortable leaving ~1 NEAR of
+**Protocol fee** — on top of the gas above, every `resume_*` call
+attaches a batch-size-indexed NEAR fee (see
+`contracts/gate/src/lib.rs:DEFAULT_FEE_TIERS`, rotatable by owner
+via `set_fee_tiers`). The fee accumulates on the gate account until
+withdrawn via `withdraw_fees(amount, to)`:
+
+| batch size | fee per resume |
+|---|---|
+| 1..=3 (incl. single-intent `resume_intent`) | 0.03 NEAR |
+| 4..=6 | 0.05 NEAR |
+| 7..=12 | 0.06 NEAR |
+| >12 | call rejected with `"exceeds max fee tier"` |
+
+The approver pays this as attached deposit; the relayer and
+dispatched inner call do not pay fees. A full variant-matrix run
+(1× claim + 1× reject + 1× sequence-n=3 + 1× sequence-n=6 + 1×
+sequence-n=12 + 1× ft-shim-n=3) accumulates **0.23 NEAR** in the
+gate's fee pot. Approver balance should be sized for N fee charges;
+the default `USER_INITIAL_BALANCE_NEAR=1` NEAR covers ~16 tier-3
+batches — bump via `.env` for sustained demos.
+
+Timeout and submit-rejecting variants (`bad-sig`, `expired`,
+`replay`) never call `resume_*`, so they incur no fee.
+
+The ~18-NEAR bootstrap assumes you're comfortable leaving ~1 NEAR of
 headroom per account for gas. On `clean`, balances flow back to the
 master, so the effective cost is storage rent for the duration the
 accounts exist (negligible across testing windows).
@@ -162,7 +186,8 @@ The invariants are per-network; mainnet green is the final check.
 ## What this repo does NOT attempt
 
 - Decentralized approver coordination (one approver per gate in v0.1).
-- Relayer fee accounting (relayer pays gas; no refunds or metering).
+- Relayer fee metering (relayer pays gas; fees are approver-side
+  only via attached deposit on resume — see "Protocol fee" above).
 - FT-shim is not NEP-141-compliant; use only for demo.
 - No multi-action delegates (one FunctionCall per delegate).
 - No Transfer / Stake / AddKey inner-action support.

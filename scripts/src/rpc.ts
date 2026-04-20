@@ -170,6 +170,62 @@ export async function txStatus(
   });
 }
 
+/// Wait for the OUTER receipt of a submit_intent tx to execute, without
+/// blocking on the yielded callback's resolution. `EXECUTED_OPTIMISTIC`
+/// waits for all receipts including the yield, which stays pending for
+/// ~200 blocks (the NEP-519 default wait). By the time the RPC returns,
+/// the yield has already timed out and the gate's timeout-arm has
+/// removed pending state — so a follow-up `resume_intent` panics with
+/// "unknown intent_id". Observed on first fee-mechanism testnet run.
+///
+/// Strategy: poll `EXPERIMENTAL_tx_status` with `NONE` wait; return as
+/// soon as any receipt_outcome has completed (has status). The outer
+/// receipt is first in the chain, so the first non-empty
+/// `receipts_outcome` entry is the one that contains the
+/// `intent_submitted` trace and status. The yielded callback's receipt
+/// stays unresolved, which is fine — we no longer depend on it.
+export async function waitForOuterReceipt(
+  txHash: string,
+  senderId: string,
+  timeoutMs = 30_000,
+): Promise<TxStatusResult> {
+  const deadline = Date.now() + timeoutMs;
+  let attempt = 0;
+  while (Date.now() < deadline) {
+    attempt += 1;
+    try {
+      const status = await txStatus(txHash, senderId, "NONE");
+      const outer = status.receipts_outcome?.[0];
+      // A receipt's `outcome.status` may be the literal string "Started"
+      // (not-yet-executed) or a terminal object
+      // ({SuccessValue:...} | {SuccessReceiptId:...} | {Failure:...}).
+      // Only the object form means the outer call finished and emitted
+      // its logs — which is what we need to extract intent_id.
+      if (outer && outer.outcome && typeof outer.outcome.status === "object") {
+        return status;
+      }
+    } catch (err) {
+      // Tx not yet propagated / included ("doesn't exist", "unknown
+      // transaction") is expected while we're polling faster than
+      // chunk-inclusion. Fall through to retry. Real server errors
+      // (code != -32000 or different message body) bubble up.
+      if (err instanceof RpcError) {
+        const payload = `${err.message} ${typeof err.data === "string" ? err.data : JSON.stringify(err.data ?? "")}`.toLowerCase();
+        if (!/unknown|doesn't exist|does not exist|not found|pending|included/.test(payload)) {
+          throw err;
+        }
+      } else {
+        throw err;
+      }
+    }
+    const backoffMs = Math.min(1500, 250 + attempt * 100);
+    await new Promise((r) => setTimeout(r, backoffMs));
+  }
+  throw new Error(
+    `waitForOuterReceipt(${txHash}) timed out after ${timeoutMs}ms without outer-receipt execution`,
+  );
+}
+
 /// Parse `trace:{...}` JSON lines from a full tx's receipt DAG.
 export function extractTraceEvents(status: TxStatusResult): Array<Record<string, unknown>> {
   const events: Array<Record<string, unknown>> = [];

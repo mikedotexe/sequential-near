@@ -1,0 +1,9 @@
+{
+  "variant": "bad-sig",
+  "target": "register",
+  "network": "testnet",
+  "submit_tx": "AsUMdQNM74nwLM1hLyC2tgdDrmeDV2cFUDr9Y5gv4PXP",
+  "expected": "signature verification failed",
+  "actual_error": "{\"ActionError\":{\"index\":0,\"kind\":{\"FunctionCallError\":{\"ExecutionError\":\"Smart contract panicked: signature verification failed\"}}}}",
+  "rejected": true
+}

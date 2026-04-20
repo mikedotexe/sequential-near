@@ -1,0 +1,9 @@
+{
+  "variant": "expired",
+  "target": "register",
+  "network": "testnet",
+  "submit_tx": "3THXDsK4XqZGP62Dybp6u8prkRU6uXNJANrsKJw9YqL5",
+  "expected": "intent expired",
+  "actual_error": "{\"ActionError\":{\"index\":0,\"kind\":{\"FunctionCallError\":{\"ExecutionError\":\"Smart contract panicked: intent expired (max_block_height <= current block)\"}}}}",
+  "rejected": true
+}

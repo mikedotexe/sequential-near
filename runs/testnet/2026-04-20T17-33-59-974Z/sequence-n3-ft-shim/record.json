@@ -1,0 +1,73 @@
+{
+  "target": "ft-shim",
+  "network": "testnet",
+  "n": 3,
+  "permutation": [
+    2,
+    0,
+    1
+  ],
+  "values": [
+    "100",
+    "117",
+    "134"
+  ],
+  "submits": [
+    {
+      "submission_index": 0,
+      "intent_id": "28",
+      "tx": "6wL5WAWzSd3jZr9G1dJAz87DXepHoccrxYXWN97U2yWG"
+    },
+    {
+      "submission_index": 1,
+      "intent_id": "29",
+      "tx": "3VZt3S4gV1zCf1b3bxUXAiokLnCKpPbGbCpKcfECaydx"
+    },
+    {
+      "submission_index": 2,
+      "intent_id": "30",
+      "tx": "DKJ7RcQGVvsThyXMd5X4CjSmgaDPxNN9w8Fqf5MMTwjb"
+    }
+  ],
+  "batch_tx": "HHFmVeW9fFEBXYaqUvPUAmHEKfMHWCc97H9CWjBjc5JP",
+  "batch_ids": [
+    "30",
+    "28",
+    "29"
+  ],
+  "fee_yocto": "30000000000000000000000",
+  "state": {
+    "pre": {
+      "alice_balance": "0",
+      "transfer_log": []
+    },
+    "post": {
+      "alice_balance": "351",
+      "transfer_log": [
+        [
+          "gate.mike.testnet",
+          "alice.mike.testnet",
+          "134"
+        ],
+        [
+          "gate.mike.testnet",
+          "alice.mike.testnet",
+          "100"
+        ],
+        [
+          "gate.mike.testnet",
+          "alice.mike.testnet",
+          "117"
+        ]
+      ]
+    }
+  },
+  "expected": {
+    "transfer_log_tail": [
+      "134",
+      "100",
+      "117"
+    ]
+  },
+  "match": true
+}

@@ -1,0 +1,25 @@
+{
+  "variant": "reject",
+  "target": "register",
+  "network": "testnet",
+  "intent_id": "5",
+  "submit_tx": "9LfN6v6KiXujAmK1d2L9bAvgsM53nk6meJFkknMsHLmh",
+  "resume_tx": "3tDbtzeNJ8VcHgLWvgazDWfC8JPPspoGhyu8vB4K9V45",
+  "state": {
+    "pre": {
+      "current": "74",
+      "log": [
+        "74"
+      ],
+      "set_count": 1
+    },
+    "post": {
+      "current": "74",
+      "log": [
+        "74"
+      ],
+      "set_count": 1
+    },
+    "unchanged": true
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "variant": "replay",
+  "target": "register",
+  "network": "testnet",
+  "first_submit_tx": "9VTUfSanpUUnRed8QKCyTJqrEqZcGuP6uVsyLQorzJEN",
+  "first_intent_id": "6",
+  "second_submit_tx": "Ce2CL1DeYGNoYKLaU8Lxzo7zANEEQ2i7kVCF8ugWVgUA",
+  "expected": "replay rejected",
+  "actual_error": "{\"ActionError\":{\"index\":0,\"kind\":{\"FunctionCallError\":{\"ExecutionError\":\"Smart contract panicked: nonce already used for this sender (replay rejected)\"}}}}",
+  "rejected": true
+}

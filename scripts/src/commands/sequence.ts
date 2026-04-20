@@ -18,6 +18,7 @@ import {
   getBlockHeight,
   txStatus,
   viewCall,
+  waitForOuterReceipt,
   type TxStatusResult,
 } from "../rpc.js";
 import { makeDirectSender, type DirectSender } from "../directSender.js";
@@ -134,7 +135,10 @@ async function submitIntent(
     GAS_SUBMIT_TGAS,
     0n,
   );
-  const status = await txStatus(txHash, ACCOUNTS.relayer, "EXECUTED_OPTIMISTIC");
+  // See rpc.ts:waitForOuterReceipt for the why: EXECUTED_OPTIMISTIC
+  // blocks on the yielded callback's 200-block timeout, racing with
+  // the resume_batch_chained we're about to send.
+  const status = await waitForOuterReceipt(txHash, ACCOUNTS.relayer);
   const intentId = extractIntentId(status);
   if (intentId === null) {
     throw new Error(`could not extract intent_id from submit tx ${txHash}`);

@@ -19,6 +19,7 @@ import {
   getBlockHeight,
   txStatus,
   viewCall,
+  waitForOuterReceipt,
   type TxStatusResult,
 } from "../rpc.js";
 import { makeDirectSender, type DirectSender } from "../directSender.js";
@@ -102,11 +103,15 @@ function extractIntentId(status: TxStatusResult): bigint | null {
 }
 
 function extractFailureReason(status: TxStatusResult): string | null {
-  if ("Failure" in status.status) {
+  // status.status and r.outcome.status can be a terminal object
+  // ({SuccessValue|SuccessReceiptId|Failure: ...}) OR a string like
+  // "Started" for receipts that haven't executed yet. Only look at
+  // objects — "Failure" in a string throws.
+  if (typeof status.status === "object" && "Failure" in status.status) {
     return JSON.stringify(status.status.Failure);
   }
   for (const r of status.receipts_outcome) {
-    if ("Failure" in r.outcome.status) {
+    if (typeof r.outcome.status === "object" && "Failure" in r.outcome.status) {
       return JSON.stringify(r.outcome.status.Failure);
     }
   }
@@ -153,7 +158,15 @@ async function submitAndObserve(
     GAS_SUBMIT_TGAS,
     0n,
   );
-  const status = await txStatus(txHash, ACCOUNTS.relayer, "EXECUTED_OPTIMISTIC");
+  // Do NOT use EXECUTED_OPTIMISTIC here — submit_intent's returned
+  // Promise is a NEP-519 yield, and waiting for the full chain blocks
+  // ~200 blocks until the yield times out, after which defensive
+  // cleanup removes pending state and any follow-up resume panics.
+  // waitForOuterReceipt polls with wait_until=NONE and returns as
+  // soon as the outer receipt (with the intent_submitted trace) has
+  // executed, leaving the yield unresolved so resume can deliver a
+  // payload in time.
+  const status = await waitForOuterReceipt(txHash, ACCOUNTS.relayer);
   const failureReason = extractFailureReason(status);
   const intentId = failureReason ? null : extractIntentId(status);
   return { txHash, intentId, failureReason, status };

@@ -1,0 +1,20 @@
+{
+  "variant": "claim",
+  "target": "register",
+  "network": "testnet",
+  "intent_id": "0",
+  "submit_tx": "9iEwwbgKqA1WhBhMD2Rcy3LxmhqsJEntDDdUeXbFSVCH",
+  "resume_tx": "59MPg65nHmxbC4cTcSKrUa5hwRLYVy37oNv5zc7SFCye",
+  "state": {
+    "pre": {
+      "current": "0",
+      "log": [],
+      "set_count": 0
+    },
+    "post": {
+      "current": "0",
+      "log": [],
+      "set_count": 0
+    }
+  }
+}

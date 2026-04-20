@@ -1,0 +1,105 @@
+{
+  "target": "register",
+  "network": "testnet",
+  "n": 6,
+  "permutation": [
+    0,
+    5,
+    2,
+    1,
+    3,
+    4
+  ],
+  "values": [
+    11,
+    22,
+    33,
+    44,
+    55,
+    66
+  ],
+  "submits": [
+    {
+      "submission_index": 0,
+      "intent_id": "10",
+      "tx": "6UAoS7C8fTBN7Ent1Fp2grkBbMZh4Q5ciNLDyxrzkEDW"
+    },
+    {
+      "submission_index": 1,
+      "intent_id": "11",
+      "tx": "D9bBTr7aePY7atafDMTNiWz8F7LBYcwiXkcxFewt5VtV"
+    },
+    {
+      "submission_index": 2,
+      "intent_id": "12",
+      "tx": "2fkUVmaJwFNEzLhgGaBvyz6bmBTJaYozK6A2CoP6FEiD"
+    },
+    {
+      "submission_index": 3,
+      "intent_id": "13",
+      "tx": "55Yd1gSyzkgAof2rifgXT7sGhSjYu6Q29hhrWEig27Nr"
+    },
+    {
+      "submission_index": 4,
+      "intent_id": "14",
+      "tx": "BQQcAJn2tYeJHRTaoMpuBVWbTJDWFkmzXyE9XgcqtW8p"
+    },
+    {
+      "submission_index": 5,
+      "intent_id": "15",
+      "tx": "F2mXgxZSkdQuyTNpn5TRYMS9qkq1PJ4gPUr9qFUphw9u"
+    }
+  ],
+  "batch_tx": "Kov3bPSgD1QXfPhCbEzWihTGQnQK5XxYWdVhS9R23Bu",
+  "batch_ids": [
+    "10",
+    "15",
+    "12",
+    "11",
+    "13",
+    "14"
+  ],
+  "fee_yocto": "50000000000000000000000",
+  "state": {
+    "pre": {
+      "current": "22",
+      "log": [
+        "74",
+        "50",
+        "33",
+        "11",
+        "22"
+      ],
+      "set_count": 5
+    },
+    "post": {
+      "current": "55",
+      "log": [
+        "74",
+        "50",
+        "33",
+        "11",
+        "22",
+        "11",
+        "66",
+        "33",
+        "22",
+        "44",
+        "55"
+      ],
+      "set_count": 11
+    }
+  },
+  "expected": {
+    "current": "55",
+    "log": [
+      "11",
+      "66",
+      "33",
+      "22",
+      "44",
+      "55"
+    ]
+  },
+  "match": true
+}

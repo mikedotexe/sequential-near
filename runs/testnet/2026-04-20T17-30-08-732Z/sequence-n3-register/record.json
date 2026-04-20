@@ -1,0 +1,69 @@
+{
+  "target": "register",
+  "network": "testnet",
+  "n": 3,
+  "permutation": [
+    2,
+    0,
+    1
+  ],
+  "values": [
+    11,
+    22,
+    33
+  ],
+  "submits": [
+    {
+      "submission_index": 0,
+      "intent_id": "7",
+      "tx": "3m4JpURwgf9VQC55BwtKfdaQWLX56g9gHMpS95u9onov"
+    },
+    {
+      "submission_index": 1,
+      "intent_id": "8",
+      "tx": "95NZfNXhYFKj5utofu8hYEzQBRoG6q875u2Z6CjkXNwT"
+    },
+    {
+      "submission_index": 2,
+      "intent_id": "9",
+      "tx": "6Pf29J36mGHMPgjmuhq1HKZxuiXZj29mMBVNcG9xmd5W"
+    }
+  ],
+  "batch_tx": "F3ciQE9TJu7NZyRpVHVkJizUzjiHNDkqHt2o5iATcoxM",
+  "batch_ids": [
+    "9",
+    "7",
+    "8"
+  ],
+  "fee_yocto": "30000000000000000000000",
+  "state": {
+    "pre": {
+      "current": "50",
+      "log": [
+        "74",
+        "50"
+      ],
+      "set_count": 2
+    },
+    "post": {
+      "current": "22",
+      "log": [
+        "74",
+        "50",
+        "33",
+        "11",
+        "22"
+      ],
+      "set_count": 5
+    }
+  },
+  "expected": {
+    "current": "22",
+    "log": [
+      "33",
+      "11",
+      "22"
+    ]
+  },
+  "match": true
+}
