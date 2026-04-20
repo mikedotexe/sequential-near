@@ -9,6 +9,8 @@ import {
   GAS_SUBMIT_TGAS,
   NEAR_NETWORK,
   RUNS_DIR,
+  SHITZU_BASE_UNITS_PER_TRANSFER,
+  SHITZU_TOKEN,
 } from "../config.js";
 import { assertMasterCredentialPresent, readCredential } from "../accounts.js";
 import {
@@ -81,18 +83,37 @@ function targetIntentArgs(
   index: number,
   values: number[],
   amounts: bigint[],
-): { receiver: string; method: string; args: Record<string, unknown> } {
+): { receiver: string; method: string; args: Record<string, unknown>; deposit: bigint } {
   if (target === "register") {
     return {
       receiver: ACCOUNTS.register,
       method: "set",
       args: { value: String(values[index]) },
+      deposit: 0n,
     };
   }
+  if (target === "ft-shim") {
+    return {
+      receiver: ACCOUNTS.ftShim,
+      method: "transfer",
+      args: { receiver_id: ACCOUNTS.alice, amount: amounts[index]!.toString() },
+      deposit: 0n,
+    };
+  }
+  // shitzu: fixed per-intent amount (see SHITZU_BASE_UNITS_PER_TRANSFER).
+  // Ordering can't be verified via on-contract log (NEP-141 doesn't
+  // expose one); the sequence runner falls back to balance-delta
+  // checking and the dispatch-block-monotonic evidence already captured
+  // in the batch tx's receipt DAG (invariant 4).
   return {
-    receiver: ACCOUNTS.ftShim,
-    method: "transfer",
-    args: { receiver_id: ACCOUNTS.alice, amount: amounts[index]!.toString() },
+    receiver: SHITZU_TOKEN,
+    method: "ft_transfer",
+    args: {
+      receiver_id: ACCOUNTS.alice,
+      amount: SHITZU_BASE_UNITS_PER_TRANSFER,
+      memo: `sequential-gate batch idx=${index}`,
+    },
+    deposit: 1n,
   };
 }
 
@@ -110,6 +131,7 @@ async function submitIntent(
   receiver: string,
   method: string,
   args: Record<string, unknown>,
+  deposit: bigint,
   nonce: bigint,
   maxBlockHeight: bigint,
   aliceKey: ReturnType<typeof readCredential>,
@@ -121,6 +143,7 @@ async function submitIntent(
       receiver,
       method,
       args,
+      deposit,
       gas: BigInt(GAS_DELEGATE_INNER_TGAS) * 1_000_000_000_000n,
       nonce,
       maxBlockHeight,
@@ -170,6 +193,26 @@ async function readFtShimState(): Promise<{
   return { alice_balance: balance, transfer_log: log };
 }
 
+async function readShitzuState(): Promise<{
+  token: string;
+  gate_balance: string;
+  alice_balance: string;
+}> {
+  const gateBalance = await viewCall<string>(SHITZU_TOKEN, "ft_balance_of", {
+    account_id: ACCOUNTS.gate,
+  });
+  const aliceBalance = await viewCall<string>(SHITZU_TOKEN, "ft_balance_of", {
+    account_id: ACCOUNTS.alice,
+  });
+  return { token: SHITZU_TOKEN, gate_balance: gateBalance, alice_balance: aliceBalance };
+}
+
+async function readTargetState(target: SubmitTarget) {
+  if (target === "register") return readRegisterState();
+  if (target === "ft-shim") return readFtShimState();
+  return readShitzuState();
+}
+
 export async function cmdSequence(opts: SequenceOpts): Promise<void> {
   assertMasterCredentialPresent();
   await assertChainIdMatches();
@@ -196,8 +239,7 @@ export async function cmdSequence(opts: SequenceOpts): Promise<void> {
   const values = valuesForRegister(opts.n);
   const amounts = amountsForFtShim(opts.n);
 
-  const pre =
-    opts.target === "register" ? await readRegisterState() : await readFtShimState();
+  const pre = await readTargetState(opts.target);
 
   // 1) Submit N intents in submission order (0..n-1). Each gets a distinct
   //    nonce and a far-future max_block_height.
@@ -205,12 +247,13 @@ export async function cmdSequence(opts: SequenceOpts): Promise<void> {
   const nonceBase = BigInt(Date.now());
   const submits: Array<{ txHash: string; intentId: bigint; submissionIndex: number }> = [];
   for (let i = 0; i < opts.n; i++) {
-    const { receiver, method, args } = targetIntentArgs(opts.target, i, values, amounts);
+    const { receiver, method, args, deposit } = targetIntentArgs(opts.target, i, values, amounts);
     const res = await submitIntent(
       relayerSender,
       receiver,
       method,
       args,
+      deposit,
       nonceBase + BigInt(i),
       maxBlockHeight,
       aliceKey,
@@ -242,8 +285,7 @@ export async function cmdSequence(opts: SequenceOpts): Promise<void> {
   await new Promise((r) => setTimeout(r, waitMs));
 
   // 5) Read target state, compute expected from permutation, compare.
-  const post =
-    opts.target === "register" ? await readRegisterState() : await readFtShimState();
+  const post = await readTargetState(opts.target);
 
   let expected: Record<string, unknown>;
   let match: boolean;
@@ -256,7 +298,7 @@ export async function cmdSequence(opts: SequenceOpts): Promise<void> {
     // entries from earlier runs).
     const tail = postR.log.slice(postR.log.length - opts.n);
     match = postR.current === expectedCurrent && JSON.stringify(tail) === JSON.stringify(expectedLog);
-  } else {
+  } else if (opts.target === "ft-shim") {
     const expectedAmounts = permutation.map((i) => amounts[i]!.toString());
     expected = { transfer_log_tail: expectedAmounts };
     const postF = post as Awaited<ReturnType<typeof readFtShimState>>;
@@ -264,6 +306,26 @@ export async function cmdSequence(opts: SequenceOpts): Promise<void> {
       .slice(postF.transfer_log.length - opts.n)
       .map(([_from, _to, amount]) => amount);
     match = JSON.stringify(tail) === JSON.stringify(expectedAmounts);
+  } else {
+    // shitzu: permutation-order verification requires per-intent
+    // distinguishability on the target, which NEP-141 doesn't provide
+    // (no on-contract transfer log). Fall back to balance-delta: total
+    // amount that moved from gate to alice should equal n * per-transfer
+    // amount. Ordering evidence lives in the batch tx's receipt DAG
+    // (invariant 4 — dispatch-block-monotonic), to be extracted via
+    // archival RPC, not scored client-side here.
+    const pre3 = pre as Awaited<ReturnType<typeof readShitzuState>>;
+    const post3 = post as Awaited<ReturnType<typeof readShitzuState>>;
+    const perTransfer = BigInt(SHITZU_BASE_UNITS_PER_TRANSFER);
+    const expectedMoved = perTransfer * BigInt(opts.n);
+    const gateDelta = BigInt(pre3.gate_balance) - BigInt(post3.gate_balance);
+    const aliceDelta = BigInt(post3.alice_balance) - BigInt(pre3.alice_balance);
+    expected = {
+      base_units_moved: expectedMoved.toString(),
+      note:
+        "Ordering not verified client-side for shitzu target — see batch_tx receipt DAG for invariant 4 evidence.",
+    };
+    match = gateDelta === expectedMoved && aliceDelta === expectedMoved;
   }
 
   const record = {

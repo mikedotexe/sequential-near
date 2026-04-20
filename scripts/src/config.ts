@@ -123,3 +123,18 @@ export function feeForBatchSize(n: number): bigint {
   const maxCap = FEE_TIERS[FEE_TIERS.length - 1]!.cap;
   throw new Error(`batch size ${n} exceeds max fee tier (${maxCap})`);
 }
+
+// ---- External NEP-141 FT targets (mainnet-only; ft-shim remains the
+// default demo target for testnet and for runs that shouldn't touch
+// third-party token state).
+//
+// `SHITZU_TOKEN` override lets test setups point at a mock or a
+// testnet fork; mainnet demos use the canonical `token.0xshitzu.near`
+// (confirmed via `ft_metadata` query 2026-04-20: decimals=18).
+// `SHITZU_BASE_UNITS_PER_TRANSFER` is the amount dispatched per
+// intent — kept tiny (1000 = 1e-15 SHITZU) so an accidental run
+// burns dust. Each ft_transfer carries 1 yoctoNEAR deposit as
+// NEP-141 requires, independent of this amount.
+export const SHITZU_TOKEN = process.env.SHITZU_TOKEN ?? "token.0xshitzu.near";
+export const SHITZU_BASE_UNITS_PER_TRANSFER =
+  process.env.SHITZU_BASE_UNITS_PER_TRANSFER ?? "1000";

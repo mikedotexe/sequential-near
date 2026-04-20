@@ -10,6 +10,8 @@ import {
   GAS_SUBMIT_TGAS,
   NEAR_NETWORK,
   RUNS_DIR,
+  SHITZU_BASE_UNITS_PER_TRANSFER,
+  SHITZU_TOKEN,
 } from "../config.js";
 import { assertMasterCredentialPresent, readCredential } from "../accounts.js";
 import {
@@ -37,7 +39,7 @@ export type SubmitVariant =
   | "expired"
   | "replay";
 
-export type SubmitTarget = "register" | "ft-shim";
+export type SubmitTarget = "register" | "ft-shim" | "shitzu";
 
 export interface SubmitOpts {
   variant: SubmitVariant;
@@ -78,18 +80,36 @@ async function buildContext(opts: SubmitOpts): Promise<RunContext> {
 
 function targetMethodAndArgs(
   target: SubmitTarget,
-): { receiver: string; method: string; args: Record<string, unknown> } {
+): { receiver: string; method: string; args: Record<string, unknown>; deposit: bigint } {
   if (target === "register") {
     return {
       receiver: ACCOUNTS.register,
       method: "set",
       args: { value: String(11 + Math.floor(Math.random() * 89)) },
+      deposit: 0n,
     };
   }
+  if (target === "ft-shim") {
+    return {
+      receiver: ACCOUNTS.ftShim,
+      method: "transfer",
+      args: { receiver_id: ACCOUNTS.alice, amount: "1000" },
+      deposit: 0n,
+    };
+  }
+  // shitzu: dispatch NEP-141 ft_transfer from gate-as-proxy to alice.
+  // The 1 yoctoNEAR deposit is the NEP-141 anti-griefing assertion.
+  // Both gate (sender) and alice (receiver) must be storage-registered
+  // on the token contract — see `scripts/test/shitzu-register.ts`.
   return {
-    receiver: ACCOUNTS.ftShim,
-    method: "transfer",
-    args: { receiver_id: ACCOUNTS.alice, amount: "1000" },
+    receiver: SHITZU_TOKEN,
+    method: "ft_transfer",
+    args: {
+      receiver_id: ACCOUNTS.alice,
+      amount: SHITZU_BASE_UNITS_PER_TRANSFER,
+      memo: "sequential-gate demo",
+    },
+    deposit: 1n,
   };
 }
 
@@ -127,15 +147,31 @@ async function readTargetState(target: SubmitTarget): Promise<Record<string, unk
     );
     return { current, log, set_count: setCount };
   }
-  const balance = await viewCall<string>(ACCOUNTS.ftShim, "balance_of", {
+  if (target === "ft-shim") {
+    const balance = await viewCall<string>(ACCOUNTS.ftShim, "balance_of", {
+      account_id: ACCOUNTS.alice,
+    });
+    const log = await viewCall<Array<[string, string, string]>>(
+      ACCOUNTS.ftShim,
+      "get_transfer_log",
+      {},
+    );
+    return { alice_balance: balance, transfer_log: log };
+  }
+  // shitzu: NEP-141 has no on-contract transfer log; verification shifts
+  // to balance deltas. Capture gate (dispatch sender) and alice (receiver)
+  // balances both sides of the run.
+  const gateBalance = await viewCall<string>(SHITZU_TOKEN, "ft_balance_of", {
+    account_id: ACCOUNTS.gate,
+  });
+  const aliceBalance = await viewCall<string>(SHITZU_TOKEN, "ft_balance_of", {
     account_id: ACCOUNTS.alice,
   });
-  const log = await viewCall<Array<[string, string, string]>>(
-    ACCOUNTS.ftShim,
-    "get_transfer_log",
-    {},
-  );
-  return { alice_balance: balance, transfer_log: log };
+  return {
+    token: SHITZU_TOKEN,
+    gate_balance: gateBalance,
+    alice_balance: aliceBalance,
+  };
 }
 
 /// Submit a valid intent and wait for the submit tx to execute
@@ -177,13 +213,14 @@ async function buildSignedBase64(
   nonce: bigint,
   maxBlockHeight: bigint,
 ): Promise<string> {
-  const { receiver, method, args } = targetMethodAndArgs(ctx.target);
+  const { receiver, method, args, deposit } = targetMethodAndArgs(ctx.target);
   const { base64 } = await buildAndSignFunctionCallIntent(
     {
       sender: ACCOUNTS.alice,
       receiver,
       method,
       args,
+      deposit,
       gas: BigInt(GAS_DELEGATE_INNER_TGAS) * 1_000_000_000_000n,
       nonce,
       maxBlockHeight,
@@ -294,12 +331,13 @@ async function runTimeout(ctx: RunContext): Promise<void> {
 async function runBadSig(ctx: RunContext): Promise<void> {
   const nonce = BigInt(Date.now());
   const maxBlockHeight = (await getBlockHeight()) + 10_000n;
-  const { receiver, method, args } = targetMethodAndArgs(ctx.target);
+  const { receiver, method, args, deposit } = targetMethodAndArgs(ctx.target);
   const delegate = buildFunctionCallDelegate({
     sender: ACCOUNTS.alice,
     receiver,
     method,
     args,
+    deposit,
     gas: BigInt(GAS_DELEGATE_INNER_TGAS) * 1_000_000_000_000n,
     nonce,
     maxBlockHeight,
@@ -326,13 +364,14 @@ async function runExpired(ctx: RunContext): Promise<void> {
   const nonce = BigInt(Date.now());
   const current = await getBlockHeight();
   const expiredMax = current - 1n;
-  const { receiver, method, args } = targetMethodAndArgs(ctx.target);
+  const { receiver, method, args, deposit } = targetMethodAndArgs(ctx.target);
   const { base64 } = await buildAndSignFunctionCallIntent(
     {
       sender: ACCOUNTS.alice,
       receiver,
       method,
       args,
+      deposit,
       gas: BigInt(GAS_DELEGATE_INNER_TGAS) * 1_000_000_000_000n,
       nonce,
       maxBlockHeight: expiredMax,

@@ -15,11 +15,15 @@ Commands:
   submit [--variant <v>] [--target <t>]
                                  end-to-end single-intent flow
                                  variant: claim | reject | timeout | bad-sig | expired | replay
-                                 target:  register (default) | ft-shim
+                                 target:  register (default) | ft-shim | shitzu
   sequence --n <N> [--target <t>] [--permutation identity|random|<csv>]
                                  N-intent chained batch with permutation check
-                                 target:       register (default) | ft-shim
+                                 target:       register (default) | ft-shim | shitzu
                                  permutation:  identity (default) | random | comma-separated
+                                 (shitzu: requires prior storage-register of
+                                  gate + alice on token.0xshitzu.near and a
+                                  funded gate balance; see
+                                  scripts/test/shitzu-register.ts)
 
 Flags:
   --i-know-this-is-testnet       required for \`clean\` on testnet
@@ -46,7 +50,7 @@ const VALID_VARIANTS: SubmitVariant[] = [
   "expired",
   "replay",
 ];
-const VALID_TARGETS: SubmitTarget[] = ["register", "ft-shim"];
+const VALID_TARGETS: SubmitTarget[] = ["register", "ft-shim", "shitzu"];
 
 async function main(): Promise<void> {
   const [, , cmd] = process.argv;
