@@ -4,6 +4,7 @@ import { KeyPair } from "near-api-js";
 
 import {
   ACCOUNTS,
+  feeForBatchSize,
   GAS_DELEGATE_INNER_TGAS,
   GAS_RESUME_TGAS,
   GAS_SUBMIT_TGAS,
@@ -185,12 +186,14 @@ async function resumeIntent(
   intentId: bigint,
   approve: boolean,
 ): Promise<string> {
+  // resume_intent is #[payable] — approver must attach the tier-1 fee.
+  // A single-intent resume counts as batch-of-1 for tier lookup.
   return ctx.approverSender.broadcastFunctionCall(
     ACCOUNTS.gate,
     "resume_intent",
     { intent_id: intentId.toString(), approve },
     GAS_RESUME_TGAS,
-    0n,
+    feeForBatchSize(1),
   );
 }
 

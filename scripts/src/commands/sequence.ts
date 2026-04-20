@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 import {
   ACCOUNTS,
+  feeForBatchSize,
   GAS_DELEGATE_INNER_TGAS,
   GAS_RESUME_TGAS,
   GAS_SUBMIT_TGAS,
@@ -218,13 +219,16 @@ export async function cmdSequence(opts: SequenceOpts): Promise<void> {
   // 2) Build the batch in permutation order.
   const batchIds = permutation.map((sourceIdx) => submits[sourceIdx]!.intentId);
 
-  // 3) Approver calls resume_batch_chained(ids).
+  // 3) Approver calls resume_batch_chained(ids). #[payable] — attach the
+  //    tier fee for this batch size. Batches > 12 are rejected by the gate;
+  //    feeForBatchSize throws client-side first so we don't burn gas.
+  const batchFeeYocto = feeForBatchSize(opts.n);
   const batchTxHash = await approverSender.broadcastFunctionCall(
     ACCOUNTS.gate,
     "resume_batch_chained",
     { intent_ids: batchIds.map((id) => id.toString()) },
     GAS_RESUME_TGAS,
-    0n,
+    batchFeeYocto,
   );
   console.log(`[sequence] batch resumed tx=${batchTxHash}`);
 
@@ -271,6 +275,7 @@ export async function cmdSequence(opts: SequenceOpts): Promise<void> {
     })),
     batch_tx: batchTxHash,
     batch_ids: batchIds.map((id) => id.toString()),
+    fee_yocto: batchFeeYocto.toString(),
     state: { pre, post },
     expected,
     match,

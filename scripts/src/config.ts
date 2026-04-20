@@ -78,10 +78,14 @@ export const REPO_ROOT = new URL("../../", import.meta.url).pathname.replace(/\/
 export const RUNS_ROOT = join(REPO_ROOT, "runs");
 export const RUNS_DIR = join(RUNS_ROOT, NEAR_NETWORK);
 
-// Per-contract initial balance. Contracts are small (~150–340 KiB);
-// 3 NEAR covers storage + plenty of runtime headroom. Alice + relayer +
-// approver are non-contract accounts; 1 NEAR is more than enough for gas.
-export const CONTRACT_INITIAL_BALANCE_NEAR = process.env.CONTRACT_INITIAL_BALANCE_NEAR ?? "3";
+// Per-contract initial balance. NEAR storage stake is ~1 NEAR per 100 KB;
+// gate.wasm at ~376 KB alone needs ~3.76 NEAR of storage headroom, so 3
+// NEAR isn't enough (first attempt on testnet failed with "wouldn't have
+// enough balance to cover storage"). 5 NEAR gives comfortable headroom
+// for the biggest wasm + runtime state growth (pending map, etc.).
+// Alice + relayer + approver are non-contract accounts; 1 NEAR is more
+// than enough for gas.
+export const CONTRACT_INITIAL_BALANCE_NEAR = process.env.CONTRACT_INITIAL_BALANCE_NEAR ?? "5";
 export const USER_INITIAL_BALANCE_NEAR = process.env.USER_INITIAL_BALANCE_NEAR ?? "1";
 
 // FT-shim total supply at init. 10^24 base units — generous headroom
@@ -98,3 +102,24 @@ export const FT_SHIM_TOTAL_SUPPLY = process.env.FT_SHIM_TOTAL_SUPPLY ?? "1000000
 export const GAS_SUBMIT_TGAS = 300;
 export const GAS_RESUME_TGAS = 150;
 export const GAS_DELEGATE_INNER_TGAS = 30;
+
+// Default fee ladder mirrored from the gate contract's DEFAULT_FEE_TIERS.
+// `resume_intent` charges tier-1; `resume_batch_chained(ids)` charges the
+// smallest tier whose cap is >= ids.length; batches > 12 are rejected.
+// If the gate's fee_tiers state is rotated via `set_fee_tiers`, these
+// constants must be re-synced (or future work: fetch via `get_fee_tiers`
+// before each resume call).
+const YOCTO_PER_NEAR = 1_000_000_000_000_000_000_000_000n; // 10^24
+export const FEE_TIERS: ReadonlyArray<{ cap: number; yocto: bigint }> = [
+  { cap: 3, yocto: (3n * YOCTO_PER_NEAR) / 100n }, // 0.03 NEAR
+  { cap: 6, yocto: (5n * YOCTO_PER_NEAR) / 100n }, // 0.05 NEAR
+  { cap: 12, yocto: (6n * YOCTO_PER_NEAR) / 100n }, // 0.06 NEAR
+];
+
+export function feeForBatchSize(n: number): bigint {
+  for (const { cap, yocto } of FEE_TIERS) {
+    if (n <= cap) return yocto;
+  }
+  const maxCap = FEE_TIERS[FEE_TIERS.length - 1]!.cap;
+  throw new Error(`batch size ${n} exceeds max fee tier (${maxCap})`);
+}

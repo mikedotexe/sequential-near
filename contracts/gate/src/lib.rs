@@ -42,6 +42,20 @@ use types::{PendingIntent, PendingIntentView, ResumeSignal, SK_PENDING, SK_RELAY
 const GAS_YIELD_CALLBACK: Gas = Gas::from_tgas(200);
 const GAS_CONTINUE_CHAIN: Gas = Gas::from_tgas(60);
 
+/// Default fee ladder seeded at `new()`. Owner can replace via
+/// `set_fee_tiers`. Caps are batch-size upper bounds (inclusive),
+/// amounts are yocto-NEAR.
+///
+/// - batch of 1..=3   → 0.03 NEAR
+/// - batch of 4..=6   → 0.05 NEAR
+/// - batch of 7..=12  → 0.06 NEAR
+/// - batch of  >12    → rejected
+const DEFAULT_FEE_TIERS: [(u32, u128); 3] = [
+    (3, 30_000_000_000_000_000_000_000),
+    (6, 50_000_000_000_000_000_000_000),
+    (12, 60_000_000_000_000_000_000_000),
+];
+
 #[near(contract_state)]
 #[derive(PanicOnDefault)]
 pub struct Gate {
@@ -64,6 +78,17 @@ pub struct Gate {
     /// run; increments at each `resume_batch_chained`. Not used for
     /// ordering — just for observability.
     active_batch_id: u64,
+    /// Fee ladder: `(max_batch_size_inclusive, fee_yocto)` sorted by
+    /// cap ascending. `resume_*` methods panic if batch size exceeds
+    /// the last cap. Owner-rotatable via `set_fee_tiers`.
+    fee_tiers: Vec<(u32, u128)>,
+    /// Lifetime sum of fees charged (yocto). Monotonic.
+    fees_collected_total: u128,
+    /// Lifetime sum of fees withdrawn (yocto). Monotonic.
+    /// `collected - withdrawn` is the fee-balance available for
+    /// withdraw; actual gate-account NEAR may exceed this if external
+    /// accounts sent tokens directly.
+    fees_withdrawn_total: u128,
 }
 
 #[near]
@@ -86,6 +111,9 @@ impl Gate {
             intents_rejected: 0,
             batch_chain_tail: Vec::new(),
             active_batch_id: 0,
+            fee_tiers: DEFAULT_FEE_TIERS.to_vec(),
+            fees_collected_total: 0,
+            fees_withdrawn_total: 0,
         }
     }
 
@@ -116,6 +144,56 @@ impl Gate {
             r#"{{"ev":"approver_set","account":"{}"}}"#,
             approver_id
         ));
+    }
+
+    /// Owner-only fee-ladder rotation. Tiers are
+    /// `(max_batch_size_inclusive, fee_yocto)`. Caps MUST be strictly
+    /// ascending and >0; the list must be non-empty. Amount ordering
+    /// is not enforced (a future regime could price larger batches
+    /// cheaper; emit an event so observers notice).
+    pub fn set_fee_tiers(&mut self, tiers: Vec<(u32, U128)>) {
+        self.assert_owner();
+        require!(!tiers.is_empty(), "fee tiers must be non-empty");
+        let mut prev_cap: u32 = 0;
+        for (cap, _) in &tiers {
+            require!(*cap > 0, "fee tier cap must be > 0");
+            require!(*cap > prev_cap, "fee tier caps must be strictly ascending");
+            prev_cap = *cap;
+        }
+        self.fee_tiers = tiers.iter().map(|(cap, amt)| (*cap, amt.0)).collect();
+        emit_trace(&format!(
+            r#"{{"ev":"fee_tiers_set","tiers_len":{},"max_cap":{}}}"#,
+            self.fee_tiers.len(),
+            prev_cap
+        ));
+    }
+
+    /// Owner-only withdrawal of accumulated fees to `to`. Bounded by
+    /// `fees_collected_total - fees_withdrawn_total` (the lifetime
+    /// ledger), not by `env::account_balance()` — this keeps storage-
+    /// staked NEAR separate from the fee pot.
+    pub fn withdraw_fees(&mut self, amount: U128, to: AccountId) -> Promise {
+        self.assert_owner();
+        let available = self
+            .fees_collected_total
+            .checked_sub(self.fees_withdrawn_total)
+            .unwrap_or(0);
+        require!(
+            amount.0 <= available,
+            format!(
+                "insufficient fee balance: requested {}, available {}",
+                amount.0, available
+            )
+        );
+        self.fees_withdrawn_total = self
+            .fees_withdrawn_total
+            .checked_add(amount.0)
+            .unwrap_or_else(|| env::panic_str("fees_withdrawn_total overflow"));
+        emit_trace(&format!(
+            r#"{{"ev":"fees_withdrawn","amount":"{}","to":"{}"}}"#,
+            amount.0, to
+        ));
+        Promise::new(to).transfer(NearToken::from_yoctonear(amount.0))
     }
 
     /// Owner-only emergency cleanup if a batch failed mid-chain and
@@ -221,11 +299,19 @@ impl Gate {
     /// Approver decides claim-vs-reject on a single pending intent.
     /// Batch resume is a separate method that lands in a follow-up
     /// commit.
+    ///
+    /// Payable: the approver attaches >= tier-1 fee (see
+    /// `get_fee_tiers`; default 0.03 NEAR). Fee is charged whether
+    /// `approve` is true or false — the gate did the verify + yield
+    /// work regardless. Timeout path is free naturally (no resume
+    /// call, no deposit).
+    #[payable]
     pub fn resume_intent(&mut self, intent_id: U64, approve: bool) {
         require!(
             env::predecessor_account_id() == self.approver_id,
             "only approver can resume"
         );
+        self.charge_fee(1);
         let pending = self
             .pending
             .remove(&intent_id.0)
@@ -255,6 +341,12 @@ impl Gate {
     /// monotonic spacing (~+3 blocks per step on NEAR). Precondition:
     /// `batch_chain_tail` must be empty (prior batch completed or was
     /// cleared via `reset_batch_tail`).
+    ///
+    /// Payable: the approver attaches >= the tier fee for
+    /// `intent_ids.len()` (see `get_fee_tiers`; default ladder 0.03 /
+    /// 0.05 / 0.06 NEAR for batches up to 3 / 6 / 12). Batches larger
+    /// than the max tier panic before any state mutation.
+    #[payable]
     pub fn resume_batch_chained(&mut self, intent_ids: Vec<U64>) {
         require!(
             env::predecessor_account_id() == self.approver_id,
@@ -265,6 +357,7 @@ impl Gate {
             self.batch_chain_tail.is_empty(),
             "a chained batch is already in flight; owner must reset_batch_tail if stuck"
         );
+        self.charge_fee(intent_ids.len() as u32);
 
         // Pre-validate every id exists before we mutate state. Catches
         // typos in the approver's batch list without leaving batch_chain_tail
@@ -485,6 +578,23 @@ impl Gate {
     pub fn get_batch_tail(&self) -> Vec<U64> {
         self.batch_chain_tail.iter().copied().map(U64).collect()
     }
+
+    /// Current fee ladder as `(cap, fee_yocto)` pairs.
+    pub fn get_fee_tiers(&self) -> Vec<(u32, U128)> {
+        self.fee_tiers
+            .iter()
+            .map(|(cap, amt)| (*cap, U128(*amt)))
+            .collect()
+    }
+
+    /// `(collected_total, withdrawn_total)` — both monotonic lifetime
+    /// counters in yocto. Available balance = collected - withdrawn.
+    pub fn get_fee_stats(&self) -> (U128, U128) {
+        (
+            U128(self.fees_collected_total),
+            U128(self.fees_withdrawn_total),
+        )
+    }
 }
 
 impl Gate {
@@ -493,6 +603,48 @@ impl Gate {
             env::predecessor_account_id() == self.owner_id,
             "owner-only"
         );
+    }
+
+    /// Smallest tier whose cap is >= `n`. Panics if `n` exceeds the
+    /// largest cap (batch too big). Also panics if the tier list is
+    /// somehow empty (guarded at setter time so this is unreachable
+    /// in practice).
+    fn fee_for(&self, n: u32) -> (u32, u128) {
+        require!(!self.fee_tiers.is_empty(), "fee tiers not configured");
+        for (cap, amount) in &self.fee_tiers {
+            if n <= *cap {
+                return (*cap, *amount);
+            }
+        }
+        let max_cap = self.fee_tiers.last().map(|(c, _)| *c).unwrap_or(0);
+        env::panic_str(&format!(
+            "batch size {} exceeds max fee tier ({})",
+            n, max_cap
+        ));
+    }
+
+    /// Read `env::attached_deposit()`, require it cover `required`,
+    /// accumulate `required` into `fees_collected_total`, emit a
+    /// `fee_charged` trace. Overage (if any) stays on the gate
+    /// account balance — no refund in v0.1.
+    fn charge_fee(&mut self, n: u32) {
+        let (tier_cap, required) = self.fee_for(n);
+        let attached = env::attached_deposit().as_yoctonear();
+        require!(
+            attached >= required,
+            format!(
+                "insufficient fee: required {} yocto for batch of {}, got {}",
+                required, n, attached
+            )
+        );
+        self.fees_collected_total = self
+            .fees_collected_total
+            .checked_add(required)
+            .unwrap_or_else(|| env::panic_str("fees_collected_total overflow"));
+        emit_trace(&format!(
+            r#"{{"ev":"fee_charged","n":{},"amount":"{}","tier_cap":{}}}"#,
+            n, required, tier_cap
+        ));
     }
 }
 
@@ -531,6 +683,20 @@ mod tests {
             .block_index(block_height)
             .build());
     }
+
+    /// Same as `with_ctx` but attaches a deposit — needed for payable
+    /// methods (`resume_intent`, `resume_batch_chained`).
+    fn with_ctx_paid(predecessor: AccountId, block_height: u64, deposit_yocto: u128) {
+        testing_env!(VMContextBuilder::new()
+            .predecessor_account_id(predecessor)
+            .block_index(block_height)
+            .attached_deposit(NearToken::from_yoctonear(deposit_yocto))
+            .build());
+    }
+
+    const TIER1_YOCTO: u128 = 30_000_000_000_000_000_000_000; // 0.03 NEAR
+    const TIER2_YOCTO: u128 = 50_000_000_000_000_000_000_000; // 0.05 NEAR
+    const TIER3_YOCTO: u128 = 60_000_000_000_000_000_000_000; // 0.06 NEAR
 
     fn make_keypair() -> SigningKey {
         let mut secret = [0u8; 32];
@@ -722,7 +888,7 @@ mod tests {
     #[should_panic(expected = "unknown intent_id")]
     fn resume_rejects_unknown_id() {
         let mut gate = init_with_relayer();
-        with_ctx(approver(), 110);
+        with_ctx_paid(approver(), 110, TIER1_YOCTO);
         gate.resume_intent(U64(999), true);
     }
 
@@ -748,7 +914,7 @@ mod tests {
     #[should_panic(expected = "unknown intent_id 999 in batch")]
     fn batch_rejects_unknown_first_id() {
         let mut gate = init_with_relayer();
-        with_ctx(approver(), 110);
+        with_ctx_paid(approver(), 110, TIER1_YOCTO);
         gate.resume_batch_chained(vec![U64(999)]);
     }
 
@@ -764,7 +930,7 @@ mod tests {
         with_ctx(relayer(), 110);
         let _ = gate.submit_intent(Base64VecU8::from(bytes));
 
-        with_ctx(approver(), 111);
+        with_ctx_paid(approver(), 111, TIER1_YOCTO);
         gate.resume_batch_chained(vec![U64(0), U64(42)]);
     }
 
@@ -944,5 +1110,251 @@ mod tests {
 
         // Dispatched successfully even though pending was never populated.
         assert_eq!(gate.stats().1 .0, 1);
+    }
+
+    // ---- fee mechanism ----
+
+    fn submit_one(gate: &mut Gate, nonce: u64) {
+        let kp = make_keypair();
+        let bytes = sample_signed_delegate(&kp, alice(), target(), nonce, 10_000);
+        with_ctx(relayer(), 110);
+        let _ = gate.submit_intent(Base64VecU8::from(bytes));
+    }
+
+    /// Run a closure expected to panic inside the mock's
+    /// `yield_id.resume(...)` stub (the testing_env mock can't deliver
+    /// a yield resume). State mutations that happened BEFORE the
+    /// panic — like fee accumulation via `charge_fee` — remain visible
+    /// on the Gate struct afterward, so tests can assert against them.
+    ///
+    /// Any panic whose message doesn't contain "resume failed" is
+    /// re-raised so real bugs still surface.
+    fn past_mock_yield_fail<F: FnOnce() + std::panic::UnwindSafe>(f: F) {
+        let result = std::panic::catch_unwind(f);
+        match result {
+            Ok(_) => panic!("expected mock yield_id.resume to fail"),
+            Err(e) => {
+                let msg = e
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                if !msg.contains("resume failed") {
+                    std::panic::resume_unwind(e);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn default_fee_tiers_are_seeded() {
+        with_ctx(owner(), 100);
+        let gate = Gate::new(owner(), approver());
+        let tiers = gate.get_fee_tiers();
+        assert_eq!(tiers.len(), 3);
+        assert_eq!(tiers[0], (3, U128(TIER1_YOCTO)));
+        assert_eq!(tiers[1], (6, U128(TIER2_YOCTO)));
+        assert_eq!(tiers[2], (12, U128(TIER3_YOCTO)));
+    }
+
+    #[test]
+    fn fee_for_maps_size_to_tier() {
+        with_ctx(owner(), 100);
+        let gate = Gate::new(owner(), approver());
+        assert_eq!(gate.fee_for(1), (3, TIER1_YOCTO));
+        assert_eq!(gate.fee_for(3), (3, TIER1_YOCTO));
+        assert_eq!(gate.fee_for(4), (6, TIER2_YOCTO));
+        assert_eq!(gate.fee_for(6), (6, TIER2_YOCTO));
+        assert_eq!(gate.fee_for(7), (12, TIER3_YOCTO));
+        assert_eq!(gate.fee_for(12), (12, TIER3_YOCTO));
+    }
+
+    #[test]
+    #[should_panic(expected = "batch size 13 exceeds max fee tier (12)")]
+    fn fee_for_panics_above_max_cap() {
+        with_ctx(owner(), 100);
+        let gate = Gate::new(owner(), approver());
+        let _ = gate.fee_for(13);
+    }
+
+    #[test]
+    #[should_panic(expected = "insufficient fee: required 30000000000000000000000 yocto for batch of 1, got 0")]
+    fn resume_intent_rejects_zero_deposit() {
+        let mut gate = init_with_relayer();
+        submit_one(&mut gate, 1);
+        with_ctx(approver(), 111); // no deposit
+        gate.resume_intent(U64(0), true);
+    }
+
+    #[test]
+    #[should_panic(expected = "insufficient fee: required 30000000000000000000000")]
+    fn resume_intent_rejects_underpayment() {
+        let mut gate = init_with_relayer();
+        submit_one(&mut gate, 1);
+        with_ctx_paid(approver(), 111, TIER1_YOCTO - 1);
+        gate.resume_intent(U64(0), true);
+    }
+
+    #[test]
+    fn resume_intent_accumulates_tier1_fee() {
+        let mut gate = init_with_relayer();
+        submit_one(&mut gate, 1);
+        with_ctx_paid(approver(), 111, TIER1_YOCTO);
+        past_mock_yield_fail(std::panic::AssertUnwindSafe(|| {
+            gate.resume_intent(U64(0), true);
+        }));
+        let (collected, withdrawn) = gate.get_fee_stats();
+        assert_eq!(collected.0, TIER1_YOCTO);
+        assert_eq!(withdrawn.0, 0);
+    }
+
+    #[test]
+    fn resume_intent_reject_still_charges_fee() {
+        // Gate did the verify+yield work; reject path pays tier-1 too.
+        let mut gate = init_with_relayer();
+        submit_one(&mut gate, 1);
+        with_ctx_paid(approver(), 111, TIER1_YOCTO);
+        past_mock_yield_fail(std::panic::AssertUnwindSafe(|| {
+            gate.resume_intent(U64(0), false);
+        }));
+        assert_eq!(gate.get_fee_stats().0 .0, TIER1_YOCTO);
+    }
+
+    #[test]
+    fn resume_intent_accepts_overpayment_and_keeps_excess() {
+        let mut gate = init_with_relayer();
+        submit_one(&mut gate, 1);
+        with_ctx_paid(approver(), 111, TIER1_YOCTO * 2); // overpay
+        past_mock_yield_fail(std::panic::AssertUnwindSafe(|| {
+            gate.resume_intent(U64(0), true);
+        }));
+        // Ledger records only the required tier fee; overage lives on
+        // the gate's account balance (no refund in v0.1).
+        assert_eq!(gate.get_fee_stats().0 .0, TIER1_YOCTO);
+    }
+
+    #[test]
+    fn batch_charge_picks_tier_by_size() {
+        // Batch of 2 ids → tier-1 (cap 3).
+        let mut gate = init_with_relayer();
+        submit_one(&mut gate, 1);
+        submit_one(&mut gate, 2);
+        with_ctx_paid(approver(), 112, TIER1_YOCTO);
+        past_mock_yield_fail(std::panic::AssertUnwindSafe(|| {
+            gate.resume_batch_chained(vec![U64(0), U64(1)]);
+        }));
+        assert_eq!(gate.get_fee_stats().0 .0, TIER1_YOCTO);
+    }
+
+    #[test]
+    #[should_panic(expected = "insufficient fee: required 50000000000000000000000 yocto for batch of 4")]
+    fn batch_of_four_requires_tier2_fee() {
+        let mut gate = init_with_relayer();
+        for i in 1..=4 {
+            submit_one(&mut gate, i);
+        }
+        with_ctx_paid(approver(), 120, TIER1_YOCTO); // tier-1 insufficient for n=4
+        gate.resume_batch_chained((0..4).map(U64).collect());
+    }
+
+    #[test]
+    #[should_panic(expected = "batch size 13 exceeds max fee tier (12)")]
+    fn batch_of_thirteen_rejected_before_state_mutation() {
+        let mut gate = init_with_relayer();
+        // Don't bother submitting — the tier check runs before id validation.
+        with_ctx_paid(approver(), 110, TIER3_YOCTO);
+        gate.resume_batch_chained((0..13).map(U64).collect());
+    }
+
+    #[test]
+    #[should_panic(expected = "owner-only")]
+    fn set_fee_tiers_rejects_non_owner() {
+        with_ctx(owner(), 100);
+        let mut gate = Gate::new(owner(), approver());
+        with_ctx(alice(), 101);
+        gate.set_fee_tiers(vec![(5, U128(1))]);
+    }
+
+    #[test]
+    #[should_panic(expected = "fee tiers must be non-empty")]
+    fn set_fee_tiers_rejects_empty() {
+        with_ctx(owner(), 100);
+        let mut gate = Gate::new(owner(), approver());
+        with_ctx(owner(), 101);
+        gate.set_fee_tiers(vec![]);
+    }
+
+    #[test]
+    #[should_panic(expected = "fee tier caps must be strictly ascending")]
+    fn set_fee_tiers_rejects_non_ascending_caps() {
+        with_ctx(owner(), 100);
+        let mut gate = Gate::new(owner(), approver());
+        with_ctx(owner(), 101);
+        gate.set_fee_tiers(vec![(5, U128(1)), (3, U128(2))]);
+    }
+
+    #[test]
+    #[should_panic(expected = "fee tier cap must be > 0")]
+    fn set_fee_tiers_rejects_zero_cap() {
+        with_ctx(owner(), 100);
+        let mut gate = Gate::new(owner(), approver());
+        with_ctx(owner(), 101);
+        gate.set_fee_tiers(vec![(0, U128(1))]);
+    }
+
+    #[test]
+    fn set_fee_tiers_rotation_changes_fee_for_resume() {
+        // Rotate to a cheaper single-tier ladder, then confirm the new
+        // fee is what resume_intent charges.
+        let mut gate = init_with_relayer();
+        with_ctx(owner(), 100);
+        gate.set_fee_tiers(vec![(20, U128(1_000))]);
+        submit_one(&mut gate, 1);
+        with_ctx_paid(approver(), 112, 1_000);
+        past_mock_yield_fail(std::panic::AssertUnwindSafe(|| {
+            gate.resume_intent(U64(0), true);
+        }));
+        assert_eq!(gate.get_fee_stats().0 .0, 1_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "owner-only")]
+    fn withdraw_fees_rejects_non_owner() {
+        with_ctx(owner(), 100);
+        let mut gate = Gate::new(owner(), approver());
+        with_ctx(alice(), 101);
+        let _ = gate.withdraw_fees(U128(0), alice());
+    }
+
+    #[test]
+    #[should_panic(expected = "insufficient fee balance: requested 1, available 0")]
+    fn withdraw_fees_rejects_over_available() {
+        with_ctx(owner(), 100);
+        let mut gate = Gate::new(owner(), approver());
+        with_ctx(owner(), 101);
+        let _ = gate.withdraw_fees(U128(1), alice());
+    }
+
+    #[test]
+    fn withdraw_fees_after_resume_updates_ledger() {
+        let mut gate = init_with_relayer();
+        submit_one(&mut gate, 1);
+        with_ctx_paid(approver(), 111, TIER1_YOCTO);
+        past_mock_yield_fail(std::panic::AssertUnwindSafe(|| {
+            gate.resume_intent(U64(0), true);
+        }));
+
+        with_ctx(owner(), 120);
+        let _ = gate.withdraw_fees(U128(TIER1_YOCTO), alice());
+
+        let (collected, withdrawn) = gate.get_fee_stats();
+        assert_eq!(collected.0, TIER1_YOCTO);
+        assert_eq!(withdrawn.0, TIER1_YOCTO);
+        // Second full withdrawal should fail — nothing left.
+        with_ctx(owner(), 121);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = gate.withdraw_fees(U128(1), alice());
+        }));
+        assert!(result.is_err(), "over-withdrawal should panic");
     }
 }
