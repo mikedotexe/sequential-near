@@ -61,6 +61,13 @@ submitted_at for observability.
   the submit panics.
 - **Callback fires exactly once**: either when `resume_intent(...)`
   delivers a payload, or after ~202 blocks when NEP-519 times out.
+- **Dispatch data flows via callback_args, not pending**: at
+  `submit_intent` time the gate packs `receiver / method / args /
+  deposit / gas` into the yield's callback arguments. The callback
+  is self-contained and doesn't need to read the `pending` map —
+  important because `resume_intent` removes `pending` *before* the
+  callback fires, so a state-lookup approach would silently fail on
+  the approve path.
 
 ## The dispatch tradeoff
 
@@ -91,6 +98,24 @@ In practice, v0.1 applications that use this gate should either:
   authorized agent), OR
 - Observe the `intent_submitted` and `intent_dispatched` trace
   events for user-attribution evidence.
+
+### Key-binding limitation
+
+The gate verifies the delegate's signature against the embedded
+`public_key` — it does **not** cross-check that `public_key` is
+registered as an access key on `sender_id`. A delegate signed with
+any keypair whose public_key is embedded will verify; the gate
+accepts a "delegate from Alice" as long as whoever signed it also
+supplies the pubkey they used to sign.
+
+Real NEP-366 at the runtime level additionally checks that the
+embedded pubkey is on `sender_id` with a nonce greater than the
+delegate's nonce. Doing that inline from a contract requires a
+cross-contract view call (yield on `view_access_key`), which we've
+deferred to v0.2. The primary v0.1 defense is the **relayer
+whitelist**: only whitelisted relayers can submit at all, so the
+gate's trust root is the relayer-operator, not the signer's access
+key. Keep this in mind when opening the whitelist on mainnet.
 
 ## The chained-batch flow
 

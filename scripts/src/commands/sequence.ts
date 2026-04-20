@@ -19,6 +19,7 @@ import {
   viewCall,
   type TxStatusResult,
 } from "../rpc.js";
+import { makeDirectSender, type DirectSender } from "../directSender.js";
 import { buildAndSignFunctionCallIntent } from "../delegate.js";
 import type { SubmitTarget } from "./submit.js";
 
@@ -103,10 +104,10 @@ function extractIntentId(status: TxStatusResult): bigint | null {
 }
 
 async function submitIntent(
-  target: SubmitTarget,
+  relayerSender: DirectSender,
+  receiver: string,
   method: string,
   args: Record<string, unknown>,
-  receiver: string,
   nonce: bigint,
   maxBlockHeight: bigint,
   aliceKey: ReturnType<typeof readCredential>,
@@ -125,20 +126,19 @@ async function submitIntent(
     },
     aliceKey,
   );
-  const near = await connectSender();
-  const relayer = await near.account(ACCOUNTS.relayer);
-  const outcome = await relayer.functionCall({
-    contractId: ACCOUNTS.gate,
-    methodName: "submit_intent",
-    args: { signed_delegate: base64 },
-    gas: BigInt(GAS_SUBMIT_TGAS) * 1_000_000_000_000n,
-  });
-  const status = await txStatus(outcome.transaction.hash, ACCOUNTS.relayer, "EXECUTED_OPTIMISTIC");
+  const txHash = await relayerSender.broadcastFunctionCall(
+    ACCOUNTS.gate,
+    "submit_intent",
+    { signed_delegate: base64 },
+    GAS_SUBMIT_TGAS,
+    0n,
+  );
+  const status = await txStatus(txHash, ACCOUNTS.relayer, "EXECUTED_OPTIMISTIC");
   const intentId = extractIntentId(status);
   if (intentId === null) {
-    throw new Error(`could not extract intent_id from submit tx ${outcome.transaction.hash}`);
+    throw new Error(`could not extract intent_id from submit tx ${txHash}`);
   }
-  return { txHash: outcome.transaction.hash, intentId };
+  return { txHash, intentId };
 }
 
 async function readRegisterState(): Promise<{ current: string; log: string[]; set_count: number }> {
@@ -184,6 +184,9 @@ export async function cmdSequence(opts: SequenceOpts): Promise<void> {
 
   const aliceKey = readCredential(ACCOUNTS.alice);
   const alicePubKey = aliceKey.getPublicKey();
+  const near = await connectSender();
+  const relayerSender = await makeDirectSender(near, ACCOUNTS.relayer);
+  const approverSender = await makeDirectSender(near, ACCOUNTS.approver);
 
   const values = valuesForRegister(opts.n);
   const amounts = amountsForFtShim(opts.n);
@@ -199,10 +202,10 @@ export async function cmdSequence(opts: SequenceOpts): Promise<void> {
   for (let i = 0; i < opts.n; i++) {
     const { receiver, method, args } = targetIntentArgs(opts.target, i, values, amounts);
     const res = await submitIntent(
-      opts.target,
+      relayerSender,
+      receiver,
       method,
       args,
-      receiver,
       nonceBase + BigInt(i),
       maxBlockHeight,
       aliceKey,
@@ -216,15 +219,14 @@ export async function cmdSequence(opts: SequenceOpts): Promise<void> {
   const batchIds = permutation.map((sourceIdx) => submits[sourceIdx]!.intentId);
 
   // 3) Approver calls resume_batch_chained(ids).
-  const near = await connectSender();
-  const approver = await near.account(ACCOUNTS.approver);
-  const batchOutcome = await approver.functionCall({
-    contractId: ACCOUNTS.gate,
-    methodName: "resume_batch_chained",
-    args: { intent_ids: batchIds.map((id) => id.toString()) },
-    gas: BigInt(GAS_RESUME_TGAS) * 1_000_000_000_000n,
-  });
-  console.log(`[sequence] batch resumed tx=${batchOutcome.transaction.hash}`);
+  const batchTxHash = await approverSender.broadcastFunctionCall(
+    ACCOUNTS.gate,
+    "resume_batch_chained",
+    { intent_ids: batchIds.map((id) => id.toString()) },
+    GAS_RESUME_TGAS,
+    0n,
+  );
+  console.log(`[sequence] batch resumed tx=${batchTxHash}`);
 
   // 4) Wait for all chain steps to land. Each step is ~+3 blocks; on testnet
   //    blocks are ~1s. Wait n * 5s to be safe.
@@ -267,7 +269,7 @@ export async function cmdSequence(opts: SequenceOpts): Promise<void> {
       intent_id: s.intentId.toString(),
       tx: s.txHash,
     })),
-    batch_tx: batchOutcome.transaction.hash,
+    batch_tx: batchTxHash,
     batch_ids: batchIds.map((id) => id.toString()),
     state: { pre, post },
     expected,

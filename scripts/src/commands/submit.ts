@@ -20,6 +20,7 @@ import {
   viewCall,
   type TxStatusResult,
 } from "../rpc.js";
+import { makeDirectSender, type DirectSender } from "../directSender.js";
 import {
   buildAndSignFunctionCallIntent,
   buildFunctionCallDelegate,
@@ -46,6 +47,8 @@ interface RunContext {
   target: SubmitTarget;
   aliceKey: KeyPair;
   alicePubKey: ReturnType<KeyPair["getPublicKey"]>;
+  relayerSender: DirectSender;
+  approverSender: DirectSender;
   runTimestamp: string;
   runDir: string;
 }
@@ -53,6 +56,9 @@ interface RunContext {
 async function buildContext(opts: SubmitOpts): Promise<RunContext> {
   const aliceKey = readCredential(ACCOUNTS.alice);
   const alicePubKey = aliceKey.getPublicKey();
+  const near = await connectSender();
+  const relayerSender = await makeDirectSender(near, ACCOUNTS.relayer);
+  const approverSender = await makeDirectSender(near, ACCOUNTS.approver);
   const runTimestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const runDir = join(RUNS_DIR, runTimestamp, `submit-${opts.variant}-${opts.target}`);
   mkdirSync(runDir, { recursive: true });
@@ -61,6 +67,8 @@ async function buildContext(opts: SubmitOpts): Promise<RunContext> {
     target: opts.target,
     aliceKey,
     alicePubKey,
+    relayerSender,
+    approverSender,
     runTimestamp,
     runDir,
   };
@@ -92,41 +100,19 @@ function extractIntentId(status: TxStatusResult): bigint | null {
   return null;
 }
 
-async function relayerCall(
-  methodName: string,
-  args: Record<string, unknown>,
-  gasTgas: number,
-): Promise<string> {
-  const near = await connectSender();
-  const relayer = await near.account(ACCOUNTS.relayer);
-  const outcome = await relayer.functionCall({
-    contractId: ACCOUNTS.gate,
-    methodName,
-    args,
-    gas: BigInt(gasTgas) * 1_000_000_000_000n,
-  });
-  return outcome.transaction.hash;
+function extractFailureReason(status: TxStatusResult): string | null {
+  if ("Failure" in status.status) {
+    return JSON.stringify(status.status.Failure);
+  }
+  for (const r of status.receipts_outcome) {
+    if ("Failure" in r.outcome.status) {
+      return JSON.stringify(r.outcome.status.Failure);
+    }
+  }
+  return null;
 }
 
-async function approverCall(
-  methodName: string,
-  args: Record<string, unknown>,
-  gasTgas: number,
-): Promise<string> {
-  const near = await connectSender();
-  const approver = await near.account(ACCOUNTS.approver);
-  const outcome = await approver.functionCall({
-    contractId: ACCOUNTS.gate,
-    methodName,
-    args,
-    gas: BigInt(gasTgas) * 1_000_000_000_000n,
-  });
-  return outcome.transaction.hash;
-}
-
-async function readTargetState(
-  target: SubmitTarget,
-): Promise<Record<string, unknown>> {
+async function readTargetState(target: SubmitTarget): Promise<Record<string, unknown>> {
   if (target === "register") {
     const [current, log, setCount] = await viewCall<[string, string[], number]>(
       ACCOUNTS.register,
@@ -146,11 +132,37 @@ async function readTargetState(
   return { alice_balance: balance, transfer_log: log };
 }
 
-async function submitValidIntent(
+/// Submit a valid intent and wait for the submit tx to execute
+/// optimistically so we can read the `intent_submitted` trace. If the
+/// submit itself fails (bad-sig / expired / replay), returns a null
+/// intentId + the failure reason from the tx status.
+async function submitAndObserve(
+  ctx: RunContext,
+  base64: string,
+): Promise<{
+  txHash: string;
+  intentId: bigint | null;
+  failureReason: string | null;
+  status: TxStatusResult;
+}> {
+  const txHash = await ctx.relayerSender.broadcastFunctionCall(
+    ACCOUNTS.gate,
+    "submit_intent",
+    { signed_delegate: base64 },
+    GAS_SUBMIT_TGAS,
+    0n,
+  );
+  const status = await txStatus(txHash, ACCOUNTS.relayer, "EXECUTED_OPTIMISTIC");
+  const failureReason = extractFailureReason(status);
+  const intentId = failureReason ? null : extractIntentId(status);
+  return { txHash, intentId, failureReason, status };
+}
+
+async function buildSignedBase64(
   ctx: RunContext,
   nonce: bigint,
   maxBlockHeight: bigint,
-): Promise<{ txHash: string; intentId: bigint | null; submitStatus: TxStatusResult }> {
+): Promise<string> {
   const { receiver, method, args } = targetMethodAndArgs(ctx.target);
   const { base64 } = await buildAndSignFunctionCallIntent(
     {
@@ -165,10 +177,21 @@ async function submitValidIntent(
     },
     ctx.aliceKey,
   );
-  const txHash = await relayerCall("submit_intent", { signed_delegate: base64 }, GAS_SUBMIT_TGAS);
-  const submitStatus = await txStatus(txHash, ACCOUNTS.relayer, "EXECUTED_OPTIMISTIC");
-  const intentId = extractIntentId(submitStatus);
-  return { txHash, intentId, submitStatus };
+  return base64;
+}
+
+async function resumeIntent(
+  ctx: RunContext,
+  intentId: bigint,
+  approve: boolean,
+): Promise<string> {
+  return ctx.approverSender.broadcastFunctionCall(
+    ACCOUNTS.gate,
+    "resume_intent",
+    { intent_id: intentId.toString(), approve },
+    GAS_RESUME_TGAS,
+    0n,
+  );
 }
 
 function writeRecord(ctx: RunContext, record: Record<string, unknown>): void {
@@ -183,14 +206,11 @@ async function runClaim(ctx: RunContext): Promise<void> {
   const pre = await readTargetState(ctx.target);
   const nonce = BigInt(Date.now());
   const maxBlockHeight = (await getBlockHeight()) + 10_000n;
-  const { txHash: submitHash, intentId } = await submitValidIntent(ctx, nonce, maxBlockHeight);
+  const base64 = await buildSignedBase64(ctx, nonce, maxBlockHeight);
+  const { txHash: submitHash, intentId, failureReason } = await submitAndObserve(ctx, base64);
+  if (failureReason) throw new Error(`submit failed: ${failureReason}`);
   if (intentId === null) throw new Error("could not extract intent_id from submit trace");
-  const resumeHash = await approverCall(
-    "resume_intent",
-    { intent_id: intentId.toString(), approve: true },
-    GAS_RESUME_TGAS,
-  );
-  // Give the dispatched receipt a few seconds to land + commit.
+  const resumeHash = await resumeIntent(ctx, intentId, true);
   await new Promise((r) => setTimeout(r, 6_000));
   const post = await readTargetState(ctx.target);
   writeRecord(ctx, {
@@ -208,13 +228,11 @@ async function runReject(ctx: RunContext): Promise<void> {
   const pre = await readTargetState(ctx.target);
   const nonce = BigInt(Date.now());
   const maxBlockHeight = (await getBlockHeight()) + 10_000n;
-  const { txHash: submitHash, intentId } = await submitValidIntent(ctx, nonce, maxBlockHeight);
+  const base64 = await buildSignedBase64(ctx, nonce, maxBlockHeight);
+  const { txHash: submitHash, intentId, failureReason } = await submitAndObserve(ctx, base64);
+  if (failureReason) throw new Error(`submit failed: ${failureReason}`);
   if (intentId === null) throw new Error("could not extract intent_id from submit trace");
-  const resumeHash = await approverCall(
-    "resume_intent",
-    { intent_id: intentId.toString(), approve: false },
-    GAS_RESUME_TGAS,
-  );
+  const resumeHash = await resumeIntent(ctx, intentId, false);
   await new Promise((r) => setTimeout(r, 4_000));
   const post = await readTargetState(ctx.target);
   writeRecord(ctx, {
@@ -232,17 +250,17 @@ async function runTimeout(ctx: RunContext): Promise<void> {
   const pre = await readTargetState(ctx.target);
   const nonce = BigInt(Date.now());
   const maxBlockHeight = (await getBlockHeight()) + 10_000n;
-  const { txHash: submitHash, intentId } = await submitValidIntent(ctx, nonce, maxBlockHeight);
+  const base64 = await buildSignedBase64(ctx, nonce, maxBlockHeight);
+  const { txHash: submitHash, intentId, failureReason } = await submitAndObserve(ctx, base64);
+  if (failureReason) throw new Error(`submit failed: ${failureReason}`);
   if (intentId === null) throw new Error("could not extract intent_id from submit trace");
   console.log(
     `[submit:timeout:${ctx.target}] intent ${intentId} submitted, waiting ~210 blocks (~3.5 min)…`,
   );
-  // NEP-519 budget is 202 blocks; wait a bit past that.
   const startBlock = await getBlockHeight();
   while ((await getBlockHeight()) < startBlock + 210n) {
     await new Promise((r) => setTimeout(r, 5_000));
   }
-  // After 210 blocks, poll the submit tx for the final (post-callback) trace.
   const finalStatus = await txStatus(submitHash, ACCOUNTS.relayer, "FINAL");
   const traceEvents = extractTraceEvents(finalStatus);
   const post = await readTargetState(ctx.target);
@@ -272,31 +290,26 @@ async function runBadSig(ctx: RunContext): Promise<void> {
     publicKey: ctx.alicePubKey,
   });
   const { encoded } = await signDelegate(delegate, ctx.aliceKey);
-  // Tamper with the last byte (inside the signature bytes).
   const tampered = new Uint8Array(encoded);
   const lastIdx = tampered.length - 1;
   tampered[lastIdx] = (tampered[lastIdx] ?? 0) ^ 0x01;
   const base64 = Buffer.from(tampered).toString("base64");
-  let errorMessage = "unexpected-success";
-  try {
-    await relayerCall("submit_intent", { signed_delegate: base64 }, GAS_SUBMIT_TGAS);
-  } catch (err) {
-    errorMessage = (err as Error).message ?? String(err);
-  }
+  const { txHash, failureReason } = await submitAndObserve(ctx, base64);
   writeRecord(ctx, {
     variant: "bad-sig",
     target: ctx.target,
     network: NEAR_NETWORK,
+    submit_tx: txHash,
     expected: "signature verification failed",
-    actual_error: errorMessage,
-    rejected: /signature verification failed/.test(errorMessage),
+    actual_error: failureReason ?? "unexpected-success",
+    rejected: failureReason !== null && /signature verification failed/.test(failureReason),
   });
 }
 
 async function runExpired(ctx: RunContext): Promise<void> {
   const nonce = BigInt(Date.now());
   const current = await getBlockHeight();
-  const expiredMax = current - 1n; // already expired
+  const expiredMax = current - 1n;
   const { receiver, method, args } = targetMethodAndArgs(ctx.target);
   const { base64 } = await buildAndSignFunctionCallIntent(
     {
@@ -311,51 +324,41 @@ async function runExpired(ctx: RunContext): Promise<void> {
     },
     ctx.aliceKey,
   );
-  let errorMessage = "unexpected-success";
-  try {
-    await relayerCall("submit_intent", { signed_delegate: base64 }, GAS_SUBMIT_TGAS);
-  } catch (err) {
-    errorMessage = (err as Error).message ?? String(err);
-  }
+  const { txHash, failureReason } = await submitAndObserve(ctx, base64);
   writeRecord(ctx, {
     variant: "expired",
     target: ctx.target,
     network: NEAR_NETWORK,
+    submit_tx: txHash,
     expected: "intent expired",
-    actual_error: errorMessage,
-    rejected: /expired/.test(errorMessage),
+    actual_error: failureReason ?? "unexpected-success",
+    rejected: failureReason !== null && /expired/.test(failureReason),
   });
 }
 
 async function runReplay(ctx: RunContext): Promise<void> {
   const nonce = BigInt(Date.now());
   const maxBlockHeight = (await getBlockHeight()) + 10_000n;
-  const { txHash: firstHash, intentId: firstId } = await submitValidIntent(ctx, nonce, maxBlockHeight);
-  // Approve + wait so the replay test isn't affected by pending state.
-  if (firstId !== null) {
-    await approverCall(
-      "resume_intent",
-      { intent_id: firstId.toString(), approve: true },
-      GAS_RESUME_TGAS,
-    );
+  const base64 = await buildSignedBase64(ctx, nonce, maxBlockHeight);
+
+  const first = await submitAndObserve(ctx, base64);
+  if (first.failureReason) throw new Error(`first submit failed: ${first.failureReason}`);
+  if (first.intentId !== null) {
+    await resumeIntent(ctx, first.intentId, true);
     await new Promise((r) => setTimeout(r, 4_000));
   }
-  // Second submit with SAME nonce — should be rejected.
-  let errorMessage = "unexpected-success";
-  try {
-    await submitValidIntent(ctx, nonce, maxBlockHeight);
-  } catch (err) {
-    errorMessage = (err as Error).message ?? String(err);
-  }
+
+  const second = await submitAndObserve(ctx, base64);
   writeRecord(ctx, {
     variant: "replay",
     target: ctx.target,
     network: NEAR_NETWORK,
-    first_submit_tx: firstHash,
-    first_intent_id: firstId?.toString() ?? null,
+    first_submit_tx: first.txHash,
+    first_intent_id: first.intentId?.toString() ?? null,
+    second_submit_tx: second.txHash,
     expected: "replay rejected",
-    actual_error: errorMessage,
-    rejected: /replay|nonce/.test(errorMessage),
+    actual_error: second.failureReason ?? "unexpected-success",
+    rejected: second.failureReason !== null && /replay|nonce/.test(second.failureReason),
   });
 }
 

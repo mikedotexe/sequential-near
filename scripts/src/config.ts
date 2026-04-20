@@ -89,9 +89,12 @@ export const USER_INITIAL_BALANCE_NEAR = process.env.USER_INITIAL_BALANCE_NEAR ?
 // balance to transfer on behalf of users via the dispatch path).
 export const FT_SHIM_TOTAL_SUPPLY = process.env.FT_SHIM_TOTAL_SUPPLY ?? "1000000000000000000000000";
 
-// Gas budgets for outer tx calls. The gate's callback work runs on its
-// own prepaid budget (locked at yield time inside submit_intent). These
-// are the outer-call ceilings.
-export const GAS_SUBMIT_TGAS = 100;
-export const GAS_RESUME_TGAS = 100;
+// Gas budgets for outer tx calls. submit_intent creates a yield with
+// GAS_YIELD_CALLBACK=200 Tgas reserved for the callback — that reservation
+// must fit inside the tx's attached gas, so submit needs comfortably more
+// than 200 (preamble: sig verify + state writes). 300 gives generous
+// headroom. Resume calls don't create a new yield reservation (they deliver
+// a payload to an already-yielded callback), so 150 is plenty.
+export const GAS_SUBMIT_TGAS = 300;
+export const GAS_RESUME_TGAS = 150;
 export const GAS_DELEGATE_INNER_TGAS = 30;

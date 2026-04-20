@@ -26,7 +26,7 @@
 //! See README.md and docs/architecture.md for the full discussion.
 
 use borsh::BorshDeserialize;
-use near_sdk::json_types::{Base64VecU8, U64};
+use near_sdk::json_types::{Base64VecU8, U128, U64};
 use near_sdk::store::{LookupMap, LookupSet, IterableMap};
 use near_sdk::{
     env, near, require, AccountId, Gas, GasWeight, NearToken, PanicOnDefault, Promise,
@@ -171,8 +171,16 @@ impl Gate {
         self.used_nonces.insert(nonce_key, env::block_height());
         self.intents_submitted += 1;
 
+        // Pack all dispatch data into the callback args so on_intent_resumed
+        // is self-contained and doesn't need to look up pending state (which
+        // the resume path removes before the callback fires).
         let callback_args = near_sdk::serde_json::json!({
             "intent_id": U64(intent_id),
+            "receiver": delegate.receiver_id.to_string(),
+            "method": fc.method_name.clone(),
+            "args": Base64VecU8::from(fc.args.clone()),
+            "deposit": U128(fc.deposit),
+            "gas": U64(fc.gas),
         });
         let callback_args_bytes = near_sdk::serde_json::to_vec(&callback_args)
             .unwrap_or_else(|_| env::panic_str("callback args serialization failed"));
@@ -257,6 +265,15 @@ impl Gate {
             self.batch_chain_tail.is_empty(),
             "a chained batch is already in flight; owner must reset_batch_tail if stuck"
         );
+
+        // Pre-validate every id exists before we mutate state. Catches
+        // typos in the approver's batch list without leaving batch_chain_tail
+        // dirty or dispatching a partial chain.
+        for id in &intent_ids {
+            if !self.pending.contains_key(&id.0) {
+                env::panic_str(&format!("unknown intent_id {} in batch", id.0));
+            }
+        }
 
         self.active_batch_id += 1;
         let batch_id = self.active_batch_id;
@@ -351,15 +368,27 @@ impl Gate {
     /// `signal.next_intent_id` is Some, the dispatched Promise is
     /// `.then`-chained with a `continue_chain(next_id, next_seq+1)`
     /// call that resumes the next intent.
+    ///
+    /// Dispatch data (receiver/method/args/deposit/gas) is delivered
+    /// via the callback_args baked in at `submit_intent` time, not
+    /// from the pending map — the resume path removes pending before
+    /// triggering this callback, so reading from it would fail on
+    /// the approve path. pending.remove here is defensive cleanup
+    /// for the timeout arm.
     #[private]
     pub fn on_intent_resumed(
         &mut self,
         intent_id: U64,
+        receiver: AccountId,
+        method: String,
+        args: Base64VecU8,
+        deposit: U128,
+        gas: U64,
         #[callback_result] signal: Result<ResumeSignal, PromiseError>,
     ) -> PromiseOrValue<()> {
-        // Timeout arm: pending entry may still be present (only resume paths
-        // remove it in advance). Make cleanup idempotent.
-        let pending_at_callback = self.pending.remove(&intent_id.0);
+        // Defensive cleanup: resume paths already removed pending, timeout
+        // path did not. Unconditional remove is idempotent.
+        self.pending.remove(&intent_id.0);
 
         let (approve, seq, next_intent_id) = match &signal {
             Ok(s) => (s.approve, s.sequence_number, s.next_intent_id),
@@ -382,29 +411,21 @@ impl Gate {
             return PromiseOrValue::Value(());
         }
 
-        let (target, method, args, deposit, gas) = match pending_at_callback {
-            Some(p) => (p.receiver_id, p.method, p.args, p.deposit, p.gas),
-            None => {
-                emit_trace(&format!(
-                    r#"{{"ev":"intent_resolved_err","id":{},"reason":"pending_missing_on_approve"}}"#,
-                    intent_id.0
-                ));
-                self.intents_rejected += 1;
-                return PromiseOrValue::Value(());
-            }
-        };
-
         emit_trace(&format!(
             r#"{{"ev":"intent_dispatched","id":{},"receiver":"{}","method":"{}","seq":{}}}"#,
             intent_id.0,
-            target,
+            receiver,
             method,
             seq.map(|n| n.to_string()).unwrap_or_else(|| "null".into())
         ));
         self.intents_dispatched += 1;
 
-        let dispatch = Promise::new(target)
-            .function_call(method, args, NearToken::from_yoctonear(deposit), Gas::from_gas(gas));
+        let dispatch = Promise::new(receiver).function_call(
+            method,
+            args.0,
+            NearToken::from_yoctonear(deposit.0),
+            Gas::from_gas(gas.0),
+        );
 
         if let Some(next_id) = next_intent_id {
             let next_seq = seq.map(|s| s + 1).unwrap_or(1);
@@ -724,11 +745,27 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "unknown intent_id for first in batch")]
+    #[should_panic(expected = "unknown intent_id 999 in batch")]
     fn batch_rejects_unknown_first_id() {
         let mut gate = init_with_relayer();
         with_ctx(approver(), 110);
         gate.resume_batch_chained(vec![U64(999)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown intent_id 42 in batch")]
+    fn batch_prevalidates_all_ids() {
+        // Submit one valid intent (will be id 0), then try to batch [0, 42].
+        // Should panic on the second id BEFORE mutating batch_chain_tail or
+        // removing pending for intent 0.
+        let mut gate = init_with_relayer();
+        let kp = make_keypair();
+        let bytes = sample_signed_delegate(&kp, alice(), target(), 1, 10_000);
+        with_ctx(relayer(), 110);
+        let _ = gate.submit_intent(Base64VecU8::from(bytes));
+
+        with_ctx(approver(), 111);
+        gate.resume_batch_chained(vec![U64(0), U64(42)]);
     }
 
     #[test]
@@ -772,5 +809,140 @@ mod tests {
         let mut gate = Gate::new(owner(), approver());
         gate.batch_chain_tail = vec![10, 20, 30];
         assert_eq!(gate.get_batch_tail(), vec![U64(10), U64(20), U64(30)]);
+    }
+
+    // ---- on_intent_resumed direct-invocation tests ----
+    //
+    // These tests cover the gap that the original bug hid in: the callback
+    // is reached only via yield+resume at runtime, which testing_env! can't
+    // drive end-to-end. By invoking on_intent_resumed directly with crafted
+    // args (as near-sdk's #[callback_result] would do when the resume
+    // payload deserializes cleanly), we verify the approve/reject/timeout
+    // paths in isolation — including the dispatch-path (which previously
+    // silently no-op'd because pending state had been removed by resume).
+
+    fn with_ctx_private(block: u64) {
+        // Set predecessor == current_account so #[private] passes.
+        let context = VMContextBuilder::new().build();
+        let me = context.current_account_id.clone();
+        testing_env!(VMContextBuilder::new()
+            .current_account_id(me.clone())
+            .predecessor_account_id(me)
+            .block_index(block)
+            .build());
+    }
+
+    fn sample_callback_args() -> (AccountId, String, Base64VecU8, U128, U64) {
+        (
+            target(),
+            "set".to_string(),
+            Base64VecU8::from(br#"{"value":"42"}"#.to_vec()),
+            U128(0),
+            U64(30_000_000_000_000),
+        )
+    }
+
+    #[test]
+    fn on_intent_resumed_approve_increments_dispatch() {
+        with_ctx(owner(), 100);
+        let mut gate = Gate::new(owner(), approver());
+        let (rcv, method, args, deposit, gas) = sample_callback_args();
+
+        with_ctx_private(200);
+        let _ = gate.on_intent_resumed(
+            U64(0),
+            rcv,
+            method,
+            args,
+            deposit,
+            gas,
+            Ok(ResumeSignal {
+                approve: true,
+                sequence_number: None,
+                next_intent_id: None,
+            }),
+        );
+
+        let (_submitted, dispatched, rejected, _next, _batch) = gate.stats();
+        assert_eq!(dispatched.0, 1);
+        assert_eq!(rejected.0, 0);
+    }
+
+    #[test]
+    fn on_intent_resumed_reject_increments_rejected() {
+        with_ctx(owner(), 100);
+        let mut gate = Gate::new(owner(), approver());
+        let (rcv, method, args, deposit, gas) = sample_callback_args();
+
+        with_ctx_private(200);
+        let _ = gate.on_intent_resumed(
+            U64(0),
+            rcv,
+            method,
+            args,
+            deposit,
+            gas,
+            Ok(ResumeSignal {
+                approve: false,
+                sequence_number: None,
+                next_intent_id: None,
+            }),
+        );
+
+        let (_submitted, dispatched, rejected, _next, _batch) = gate.stats();
+        assert_eq!(dispatched.0, 0);
+        assert_eq!(rejected.0, 1);
+    }
+
+    #[test]
+    fn on_intent_resumed_timeout_increments_rejected() {
+        with_ctx(owner(), 100);
+        let mut gate = Gate::new(owner(), approver());
+        let (rcv, method, args, deposit, gas) = sample_callback_args();
+
+        with_ctx_private(200);
+        let _ = gate.on_intent_resumed(
+            U64(0),
+            rcv,
+            method,
+            args,
+            deposit,
+            gas,
+            Err(PromiseError::Failed),
+        );
+
+        let (_submitted, dispatched, rejected, _next, _batch) = gate.stats();
+        assert_eq!(dispatched.0, 0);
+        assert_eq!(rejected.0, 1);
+    }
+
+    #[test]
+    fn on_intent_resumed_approve_does_not_require_pending() {
+        // The whole point of the callback_args refactor: the callback can
+        // dispatch even when pending was already removed (the normal case
+        // on the approve path, since resume_intent removes pending before
+        // the callback fires).
+        with_ctx(owner(), 100);
+        let mut gate = Gate::new(owner(), approver());
+        // Explicitly do NOT insert into pending.
+        let (rcv, method, args, deposit, gas) = sample_callback_args();
+
+        with_ctx_private(200);
+        let _ = gate.on_intent_resumed(
+            U64(99),
+            rcv,
+            method,
+            args,
+            deposit,
+            gas,
+            Ok(ResumeSignal {
+                approve: true,
+                sequence_number: Some(0),
+                next_intent_id: None,
+            }),
+        );
+
+        // Dispatched successfully even though pending was never populated.
+        assert_eq!(gate.stats().1 .0, 1);
     }
 }
