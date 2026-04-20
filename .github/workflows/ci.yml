@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Three gates: the Rust wasm build, Rust host-target unit tests
+# (nep366 + gate + register + ft-shim), and the TypeScript type
+# check + runtime tests (delegate encoding + permutation parsing).
+# None of these require network access — the end-to-end testnet /
+# mainnet flow lives in `sequential submit` and `sequential sequence`
+# and is triggered manually.
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust (stable + wasm32-unknown-unknown)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: cargo build --release --target wasm32-unknown-unknown --workspace
+        run: cargo build --release --target wasm32-unknown-unknown --workspace
+
+      - name: cargo test --workspace (host target)
+        run: cargo test --workspace
+
+      - name: npm install (scripts/)
+        working-directory: scripts
+        run: npm install
+
+      - name: tsc --noEmit (scripts/)
+        run: ./scripts/node_modules/.bin/tsc --noEmit -p scripts/tsconfig.json
+
+      - name: npm test (scripts/) — delegate + permutation unit tests
+        working-directory: scripts
+        run: npm test
