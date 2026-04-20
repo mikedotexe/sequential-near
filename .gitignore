@@ -1,0 +1,13 @@
+target/
+scripts/node_modules/
+scripts/dist/
+scripts/package-lock.json
+.DS_Store
+
+# runs/ is NOT gitignored. Per-run artifacts (record.json per submit/sequence
+# invocation) are committed as durable evidence of the sequencer primitive's
+# behavior on both testnet and mainnet. See docs/verification.md.
+
+# Local env (copied from .env.example). Contains FASTNEAR_API_KEY and
+# NEAR_NETWORK among other overrides.
+.env

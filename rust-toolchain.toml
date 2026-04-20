@@ -1,0 +1,10 @@
+[toolchain]
+# Pin stable + wasm32 target so two contributors cloning this repo and
+# running `cargo build --release --target wasm32-unknown-unknown` produce
+# byte-identical wasm. Combined with the committed Cargo.lock this gives
+# reproducible contract builds across machines — important because the
+# gate's signature-verification code path is load-bearing and we want the
+# deployed bytes on testnet and mainnet to be reconstructible from source.
+channel = "stable"
+targets = ["wasm32-unknown-unknown"]
+profile = "minimal"
