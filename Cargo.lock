@@ -978,6 +978,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ft-shim"
+version = "0.1.0"
+dependencies = [
+ "near-sdk",
+]
+
+[[package]]
 name = "funty"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
