@@ -1,0 +1,22 @@
+{
+  "variant": "claim",
+  "target": "register",
+  "network": "mainnet",
+  "intent_id": "0",
+  "submit_tx": "ARf6EQeEr6mZ1wZozRZWg1bnosgBxMUEvAUXTUNC1cC1",
+  "resume_tx": "Fyi9gjwDFk1aYnPXZx8PsApGZGXk3VjL6qdchuaJ6R9",
+  "state": {
+    "pre": {
+      "current": "0",
+      "log": [],
+      "set_count": 0
+    },
+    "post": {
+      "current": "69",
+      "log": [
+        "69"
+      ],
+      "set_count": 1
+    }
+  }
+}
