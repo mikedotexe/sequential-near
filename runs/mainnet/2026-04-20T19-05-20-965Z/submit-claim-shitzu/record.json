@@ -1,0 +1,20 @@
+{
+  "variant": "claim",
+  "target": "shitzu",
+  "network": "mainnet",
+  "intent_id": "4",
+  "submit_tx": "6GHSpy1modJJpSGNaKZVuAztP3VqB5ktXYZNDUbHpTro",
+  "resume_tx": "13CkBZ8fJtFXidRQg6bcxwbsySz7uxeJfWUFGYRXDj42",
+  "state": {
+    "pre": {
+      "token": "token.0xshitzu.near",
+      "gate_balance": "1000000",
+      "alice_balance": "0"
+    },
+    "post": {
+      "token": "token.0xshitzu.near",
+      "gate_balance": "999000",
+      "alice_balance": "1000"
+    }
+  }
+}

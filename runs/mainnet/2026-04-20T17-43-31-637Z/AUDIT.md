@@ -157,3 +157,106 @@ curl -sS -X POST https://archival-rpc.mainnet.fastnear.com \
     \"tx_hash\":\"$TX\",\"sender_account_id\":\"approver.sequential.near\",
     \"wait_until\":\"FINAL\"}}" | jq
 ```
+
+---
+
+## SHITZU spike — 2026-04-20 T19:05Z
+
+Extended the same `gate.sequential.near` deployment to sequence
+transfers of the real `token.0xshitzu.near` NEP-141 fungible token.
+Proves invariant 4 (`dispatch-block-monotonic`) survives the
+cross-contract hop and that the gate-as-proxy pattern composes
+cleanly with a third-party NEP-141 contract it does not control.
+
+### Bootstrap txs
+
+| event | tx hash | cost |
+|---|---|---|
+| storage_deposit for `gate.sequential.near` on `token.0xshitzu.near` | `J8mJd6MZmH4wsZ99rT8VjTMhE2B8Kx7zcyiPYLTnsRmv` | 0.00125 N |
+| storage_deposit for `alice.sequential.near` on `token.0xshitzu.near` | `377P7YuVfXZBoEgYQYBGmj6xWQCPCKAUGDSkU9jfUhiz` | 0.00125 N |
+| `ft_transfer` seed from `mike.near` → `gate.sequential.near` (1,000,000 base units = 10⁻¹² SHITZU) | `C8kNJ5hQPYyLG5Pkc3cxcLV88MEgziTbVUc9kkaisDZv` | 1 yocto |
+
+### Single-intent claim (`submit --variant claim --target shitzu`)
+
+Intent `id=4`. State: `gate 1,000,000 → 999,000` and `alice 0 → 1,000` base units.
+
+| event | tx / receipt | signer |
+|---|---|---|
+| submit_tx | `6GHSpy1modJJpSGNaKZVuAztP3VqB5ktXYZNDUbHpTro` | relayer |
+| resume_tx | `13CkBZ8fJtFXidRQg6bcxwbsySz7uxeJfWUFGYRXDj42` (fee 0.03 N charged) | approver |
+
+`gate.sequential.near` becomes `predecessor_id` on
+`token.0xshitzu.near.ft_transfer`; NEP-141 sees the transfer as
+gate-originated, confirming the gate-as-treasury model.
+
+### Chained batch (`sequence --n 3 --permutation 2,0,1 --target shitzu`)
+
+Three submissions, then one batch resume dispatching intents
+`[7, 5, 6]` in that order. Each intent transfers 1,000 base units
+from gate to alice. Final state: `gate 999,000 → 996,000`,
+`alice 1,000 → 4,000`.
+
+| event | tx / receipt | signer |
+|---|---|---|
+| submit intent 5 | `ACqP1UoHowXKZ2AT547VfjPdUUcfZV3gKjgJrG4djz2u` | relayer |
+| submit intent 6 | `85FDbUjWjXkBAutAqFWyCb83LRFtRB7cCe7WsJnXLoWV` | relayer |
+| submit intent 7 | `GJDuvxa29zA1GhG1yRtUC5DvqFPZotfXxDLpyLphVxsq` | relayer |
+| batch resume | `Ang3ASvU7tqAtzzYf41rHa5iSsTuSpoza3UxKHc7eKVB` (fee 0.03 N charged) | approver |
+
+### Invariant 4 — dispatch DAG across an external NEP-141 contract
+
+Dispatches extracted from each submit tx's yielded-callback DAG; the
+NEP-141 `EVENT_JSON` log fires on `token.0xshitzu.near` exactly one
+block after the gate dispatches, as expected (cross-contract Promise
+resolution is +1 block).
+
+| seq | intent | dispatch block | Δ | NEP-141 event block |
+|---|---|---|---|---|
+| 0 | 7 | 194862408 | – | 194862409 |
+| 1 | 5 | 194862411 | **+3** | 194862412 |
+| 2 | 6 | 194862414 | **+3** | 194862415 |
+
+Per-step Δ is exactly 3 — identical to the register-target result
+from the earlier session. The external-contract hop does not
+perturb the block-monotonic quantum.
+
+### Gate state after the SHITZU spike
+
+```
+stats()        → ("8","8","0","8","2")
+                  (submitted, dispatched, rejected, next_intent_id, active_batch_id)
+get_fee_stats  → ("0.12 NEAR", "0")
+                  (cumulative: 4 resume calls × 0.03 NEAR tier-1 fee each)
+```
+
+SHITZU token balances (via `token.0xshitzu.near.ft_balance_of`):
+
+```
+gate.sequential.near:  996,000 base units = 9.96 × 10⁻¹³ SHITZU
+alice.sequential.near: 4,000 base units   = 4.00 × 10⁻¹⁵ SHITZU
+```
+
+### Reproducing the SHITZU audit
+
+```bash
+# Walk the batch tx's receipt DAG (only the outer + continue_chain
+# receipts live here; the actual ft_transfer dispatches are in the
+# three submit txs' yielded-callback DAGs).
+curl -sS -X POST https://archival-rpc.mainnet.fastnear.com \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":"x","method":"tx","params":{
+    "tx_hash":"Ang3ASvU7tqAtzzYf41rHa5iSsTuSpoza3UxKHc7eKVB",
+    "sender_account_id":"approver.sequential.near",
+    "wait_until":"FINAL"}}' | jq '.result.receipts_outcome[].outcome.logs'
+
+# Walk each submit tx to extract intent_dispatched trace + ft_transfer event
+for TX in ACqP1UoHowXKZ2AT547VfjPdUUcfZV3gKjgJrG4djz2u \
+          85FDbUjWjXkBAutAqFWyCb83LRFtRB7cCe7WsJnXLoWV \
+          GJDuvxa29zA1GhG1yRtUC5DvqFPZotfXxDLpyLphVxsq; do
+  curl -sS -X POST https://archival-rpc.mainnet.fastnear.com \
+    -H "Content-Type: application/json" \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":\"x\",\"method\":\"tx\",\"params\":{
+      \"tx_hash\":\"$TX\",\"sender_account_id\":\"relayer.sequential.near\",
+      \"wait_until\":\"FINAL\"}}" | jq '.result.receipts_outcome[].outcome.logs'
+done
+```

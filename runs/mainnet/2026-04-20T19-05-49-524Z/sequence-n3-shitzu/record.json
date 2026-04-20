@@ -1,0 +1,56 @@
+{
+  "target": "shitzu",
+  "network": "mainnet",
+  "n": 3,
+  "permutation": [
+    2,
+    0,
+    1
+  ],
+  "values": [
+    "100",
+    "117",
+    "134"
+  ],
+  "submits": [
+    {
+      "submission_index": 0,
+      "intent_id": "5",
+      "tx": "ACqP1UoHowXKZ2AT547VfjPdUUcfZV3gKjgJrG4djz2u"
+    },
+    {
+      "submission_index": 1,
+      "intent_id": "6",
+      "tx": "85FDbUjWjXkBAutAqFWyCb83LRFtRB7cCe7WsJnXLoWV"
+    },
+    {
+      "submission_index": 2,
+      "intent_id": "7",
+      "tx": "GJDuvxa29zA1GhG1yRtUC5DvqFPZotfXxDLpyLphVxsq"
+    }
+  ],
+  "batch_tx": "Ang3ASvU7tqAtzzYf41rHa5iSsTuSpoza3UxKHc7eKVB",
+  "batch_ids": [
+    "7",
+    "5",
+    "6"
+  ],
+  "fee_yocto": "30000000000000000000000",
+  "state": {
+    "pre": {
+      "token": "token.0xshitzu.near",
+      "gate_balance": "999000",
+      "alice_balance": "1000"
+    },
+    "post": {
+      "token": "token.0xshitzu.near",
+      "gate_balance": "996000",
+      "alice_balance": "4000"
+    }
+  },
+  "expected": {
+    "base_units_moved": "3000",
+    "note": "Ordering not verified client-side for shitzu target — see batch_tx receipt DAG for invariant 4 evidence."
+  },
+  "match": true
+}
