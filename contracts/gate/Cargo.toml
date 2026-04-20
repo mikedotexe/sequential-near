@@ -1,0 +1,23 @@
+[package]
+name = "gate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = { workspace = true }
+borsh = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+near-sdk = { workspace = true, features = ["unit-testing"] }
+# For generating test fixtures in unit tests. Lets us sign and verify real
+# ed25519 signatures against the nep366 module without needing near-api-js.
+ed25519-dalek = "2"
+rand = "0.8"
+hex = "0.4"
