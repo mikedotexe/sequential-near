@@ -1,17 +1,24 @@
-//! Signed-intent sequencer gate — v0.1 single-intent path.
+//! Signed-intent sequencer gate.
 //!
-//! Flow: a whitelisted relayer submits a borsh-serialized, base64-
-//! encoded `SignedDelegateAction` (NEP-366 wire format) to
-//! `submit_intent`. The gate verifies the signature, checks expiry +
-//! nonce, stores the pending intent under NEP-519 yield, and returns
-//! the yield promise. A coordinator (the `approver_id`) later calls
-//! `resume_intent(id, approve)` to either dispatch or reject the
-//! intent. On timeout (202 blocks with no resume) the callback also
-//! fires with an error, ensuring the pending entry is cleaned up.
+//! Single-intent flow: a whitelisted relayer submits a borsh-
+//! serialized, base64-encoded `SignedDelegateAction` (NEP-366 wire
+//! format) to `submit_intent`. The gate verifies the signature,
+//! checks expiry + nonce, stores the pending intent under NEP-519
+//! yield, and returns the yield promise. A coordinator (the
+//! `approver_id`) later calls `resume_intent(id, approve)` to either
+//! dispatch or reject the intent. On timeout (202 blocks with no
+//! resume) the callback also fires with an error, ensuring the
+//! pending entry is cleaned up.
 //!
-//! Chained-batch resume lands in a follow-up commit (see plan); the
-//! batch-tail state is already present so `submit_intent`'s storage
-//! layout is stable across the two commits.
+//! Chained-batch flow: approver calls `resume_batch_chained(ids)`.
+//! The gate resumes `ids[0]` with a signal carrying `next_intent_id =
+//! ids[1]`; the yielded callback dispatches the first intent's
+//! FunctionCall and `.then()`-chains a `continue_chain(next_id,
+//! next_seq+1)` callback. `continue_chain` resumes the next intent
+//! with its own threaded next_intent_id, and so on until the tail is
+//! empty. Produces strict block-monotonic dispatch (+3 blocks per
+//! step) and transactional sequencing (intent[i]'s state commits
+//! before intent[i+1]'s target executes).
 //!
 //! Architectural tradeoff: the dispatched receipt has
 //! `predecessor_id = gate`, not `sender_id`, because near-sdk 5.26.1's
@@ -33,6 +40,7 @@ use nep366::SignedDelegateAction;
 use types::{PendingIntent, PendingIntentView, ResumeSignal, SK_PENDING, SK_RELAYERS, SK_USED_NONCES};
 
 const GAS_YIELD_CALLBACK: Gas = Gas::from_tgas(200);
+const GAS_CONTINUE_CHAIN: Gas = Gas::from_tgas(60);
 
 #[near(contract_state)]
 #[derive(PanicOnDefault)]
@@ -46,6 +54,16 @@ pub struct Gate {
     intents_submitted: u64,
     intents_dispatched: u64,
     intents_rejected: u64,
+    /// The tail of an in-flight chained batch. When
+    /// `resume_batch_chained(ids)` is called, `batch_chain_tail` is
+    /// set to `ids[1..]`. Each `continue_chain` call pops the front.
+    /// Must be empty when a new batch starts — the `require!` at the
+    /// top of `resume_batch_chained` enforces this.
+    batch_chain_tail: Vec<u64>,
+    /// Monotonic batch counter for telemetry. 0 = no batch has ever
+    /// run; increments at each `resume_batch_chained`. Not used for
+    /// ordering — just for observability.
+    active_batch_id: u64,
 }
 
 #[near]
@@ -66,6 +84,8 @@ impl Gate {
             intents_submitted: 0,
             intents_dispatched: 0,
             intents_rejected: 0,
+            batch_chain_tail: Vec::new(),
+            active_batch_id: 0,
         }
     }
 
@@ -95,6 +115,19 @@ impl Gate {
         emit_trace(&format!(
             r#"{{"ev":"approver_set","account":"{}"}}"#,
             approver_id
+        ));
+    }
+
+    /// Owner-only emergency cleanup if a batch failed mid-chain and
+    /// left `batch_chain_tail` dirty. Explicit rather than automatic
+    /// because silently clearing mid-batch state would mask real bugs.
+    pub fn reset_batch_tail(&mut self) {
+        self.assert_owner();
+        let cleared = self.batch_chain_tail.len();
+        self.batch_chain_tail.clear();
+        emit_trace(&format!(
+            r#"{{"ev":"batch_tail_reset","cleared":{}}}"#,
+            cleared
         ));
     }
 
@@ -209,11 +242,115 @@ impl Gate {
         ));
     }
 
+    /// Approver-submitted ordering of already-yielded intents. Each
+    /// intent resumes + dispatches in chain order with strict block-
+    /// monotonic spacing (~+3 blocks per step on NEAR). Precondition:
+    /// `batch_chain_tail` must be empty (prior batch completed or was
+    /// cleared via `reset_batch_tail`).
+    pub fn resume_batch_chained(&mut self, intent_ids: Vec<U64>) {
+        require!(
+            env::predecessor_account_id() == self.approver_id,
+            "only approver can batch-resume"
+        );
+        require!(!intent_ids.is_empty(), "batch must not be empty");
+        require!(
+            self.batch_chain_tail.is_empty(),
+            "a chained batch is already in flight; owner must reset_batch_tail if stuck"
+        );
+
+        self.active_batch_id += 1;
+        let batch_id = self.active_batch_id;
+        let n = intent_ids.len();
+        let first_id = intent_ids[0].0;
+        self.batch_chain_tail = intent_ids[1..].iter().map(|u| u.0).collect();
+        let next_for_first = self.batch_chain_tail.first().copied().map(U64);
+
+        let pending = self
+            .pending
+            .remove(&first_id)
+            .unwrap_or_else(|| env::panic_str("unknown intent_id for first in batch"));
+
+        let signal = ResumeSignal {
+            approve: true,
+            sequence_number: Some(0),
+            next_intent_id: next_for_first,
+        };
+        let payload = near_sdk::serde_json::to_vec(&signal)
+            .unwrap_or_else(|_| env::panic_str("resume payload serialization failed"));
+
+        pending
+            .yield_id
+            .resume(payload)
+            .unwrap_or_else(|_| env::panic_str("resume failed for first (not found or expired)"));
+
+        emit_trace(&format!(
+            r#"{{"ev":"batch_started","batch_id":{},"n":{},"first_id":{}}}"#,
+            batch_id, n, first_id
+        ));
+    }
+
+    /// `.then`-chained off each intent's dispatched FunctionCall. Pops
+    /// the next id from `batch_chain_tail` and resumes it. Ignores the
+    /// previous dispatch's outcome — a failed inner dispatch does NOT
+    /// abort the rest of the chain (the coordinator owns retry
+    /// semantics).
+    ///
+    /// Does NOT use `#[callback_result]` — the gate is a generic
+    /// dispatcher; inner targets may return anything (primitives,
+    /// `()`, structs). A `#[callback_result]` annotation would attempt
+    /// JSON deserialization of the previous Promise's return bytes,
+    /// which fails on `()` returns ("EOF while parsing"). `.then()`
+    /// still fires this callback after the previous Promise resolves;
+    /// the value just isn't consulted.
+    #[private]
+    pub fn continue_chain(&mut self, next_id: U64, next_seq: u32) -> PromiseOrValue<()> {
+        let popped = self
+            .batch_chain_tail
+            .first()
+            .copied()
+            .unwrap_or_else(|| env::panic_str("batch_chain_tail empty but expected next_id"));
+        require!(
+            popped == next_id.0,
+            "chain tail mismatch (state drifted from expected next_id)"
+        );
+        self.batch_chain_tail.remove(0);
+
+        let pending = self
+            .pending
+            .remove(&next_id.0)
+            .unwrap_or_else(|| env::panic_str("unknown next_id in continue_chain"));
+
+        let next_next_id = self.batch_chain_tail.first().copied().map(U64);
+        let signal = ResumeSignal {
+            approve: true,
+            sequence_number: Some(next_seq),
+            next_intent_id: next_next_id,
+        };
+        let payload = near_sdk::serde_json::to_vec(&signal)
+            .unwrap_or_else(|_| env::panic_str("resume payload serialization failed"));
+
+        pending
+            .yield_id
+            .resume(payload)
+            .unwrap_or_else(|_| env::panic_str("resume failed in continue_chain"));
+
+        emit_trace(&format!(
+            r#"{{"ev":"chain_continued","next_id":{},"next_seq":{},"tail_remaining":{}}}"#,
+            next_id.0,
+            next_seq,
+            self.batch_chain_tail.len()
+        ));
+        PromiseOrValue::Value(())
+    }
+
     // ---- callbacks (private) ----
 
     /// Yielded callback fires on: (1) approver resume with approve=true
     /// or =false, (2) NEP-519 timeout after ~202 blocks with no resume.
-    /// Single-intent flow — batch chaining lands in a follow-up commit.
+    /// Handles both single-intent and chained-batch dispatch — when
+    /// `signal.next_intent_id` is Some, the dispatched Promise is
+    /// `.then`-chained with a `continue_chain(next_id, next_seq+1)`
+    /// call that resumes the next intent.
     #[private]
     pub fn on_intent_resumed(
         &mut self,
@@ -224,8 +361,8 @@ impl Gate {
         // remove it in advance). Make cleanup idempotent.
         let pending_at_callback = self.pending.remove(&intent_id.0);
 
-        let approve = match &signal {
-            Ok(s) => s.approve,
+        let (approve, seq, next_intent_id) = match &signal {
+            Ok(s) => (s.approve, s.sequence_number, s.next_intent_id),
             Err(e) => {
                 emit_trace(&format!(
                     r#"{{"ev":"intent_resolved_err","id":{},"reason":"timeout","detail":"{:?}"}}"#,
@@ -245,37 +382,41 @@ impl Gate {
             return PromiseOrValue::Value(());
         }
 
-        // Approve path: dispatch via Promise::new(target).function_call(...).
-        // We need the target/method/args; these came from the pending entry.
-        // Since resume_intent already removed the pending, we captured it
-        // above in pending_at_callback (may be None on timeout, but we
-        // already returned for that case).
-        let target = pending_at_callback.as_ref().map(|p| p.receiver_id.clone());
         let (target, method, args, deposit, gas) = match pending_at_callback {
             Some(p) => (p.receiver_id, p.method, p.args, p.deposit, p.gas),
             None => {
-                // resume_intent removed pending BEFORE the resume hit the
-                // runtime, and the callback re-entered after another resume
-                // or a race. We can't dispatch without the intent data.
                 emit_trace(&format!(
                     r#"{{"ev":"intent_resolved_err","id":{},"reason":"pending_missing_on_approve"}}"#,
                     intent_id.0
                 ));
                 self.intents_rejected += 1;
-                let _ = target;
                 return PromiseOrValue::Value(());
             }
         };
 
         emit_trace(&format!(
-            r#"{{"ev":"intent_dispatched","id":{},"receiver":"{}","method":"{}"}}"#,
-            intent_id.0, target, method
+            r#"{{"ev":"intent_dispatched","id":{},"receiver":"{}","method":"{}","seq":{}}}"#,
+            intent_id.0,
+            target,
+            method,
+            seq.map(|n| n.to_string()).unwrap_or_else(|| "null".into())
         ));
         self.intents_dispatched += 1;
 
         let dispatch = Promise::new(target)
             .function_call(method, args, NearToken::from_yoctonear(deposit), Gas::from_gas(gas));
-        PromiseOrValue::Promise(dispatch)
+
+        if let Some(next_id) = next_intent_id {
+            let next_seq = seq.map(|s| s + 1).unwrap_or(1);
+            let chained = dispatch.then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(GAS_CONTINUE_CHAIN)
+                    .continue_chain(next_id, next_seq),
+            );
+            PromiseOrValue::Promise(chained)
+        } else {
+            PromiseOrValue::Promise(dispatch)
+        }
     }
 
     // ---- views ----
@@ -309,14 +450,19 @@ impl Gate {
     }
 
     /// Roll-up counters for observability. Returns
-    /// `(submitted, dispatched, rejected, next_intent_id)`.
-    pub fn stats(&self) -> (U64, U64, U64, U64) {
+    /// `(submitted, dispatched, rejected, next_intent_id, active_batch_id)`.
+    pub fn stats(&self) -> (U64, U64, U64, U64, U64) {
         (
             U64(self.intents_submitted),
             U64(self.intents_dispatched),
             U64(self.intents_rejected),
             U64(self.next_intent_id),
+            U64(self.active_batch_id),
         )
+    }
+
+    pub fn get_batch_tail(&self) -> Vec<U64> {
+        self.batch_chain_tail.iter().copied().map(U64).collect()
     }
 }
 
@@ -417,6 +563,7 @@ mod tests {
         assert_eq!(gate.get_owner(), owner());
         assert_eq!(gate.get_approver(), approver());
         assert_eq!(gate.stats().0 .0, 0);
+        assert_eq!(gate.stats().4 .0, 0);
     }
 
     #[test]
@@ -510,11 +657,12 @@ mod tests {
         assert_eq!(view.expires_at_block.0, 10_000);
         assert_eq!(view.submitted_at_block.0, 110);
 
-        let (submitted, dispatched, rejected, next_id) = gate.stats();
+        let (submitted, dispatched, rejected, next_id, batch_id) = gate.stats();
         assert_eq!(submitted.0, 1);
         assert_eq!(dispatched.0, 0);
         assert_eq!(rejected.0, 0);
         assert_eq!(next_id.0, 1);
+        assert_eq!(batch_id.0, 0);
 
         assert_eq!(gate.list_pending(), vec![U64(0)]);
     }
@@ -535,6 +683,7 @@ mod tests {
         assert!(gate.get_pending(U64(0)).is_some());
         assert!(gate.get_pending(U64(1)).is_some());
         assert_eq!(gate.stats().3 .0, 2);
+        assert_eq!(gate.stats().4 .0, 0); // no batch started
         let mut listed = gate.list_pending();
         listed.sort_by_key(|u| u.0);
         assert_eq!(listed, vec![U64(0), U64(1)]);
@@ -554,5 +703,74 @@ mod tests {
         let mut gate = init_with_relayer();
         with_ctx(approver(), 110);
         gate.resume_intent(U64(999), true);
+    }
+
+    // ---- batch ----
+
+    #[test]
+    #[should_panic(expected = "only approver can batch-resume")]
+    fn batch_rejects_non_approver() {
+        let mut gate = init_with_relayer();
+        with_ctx(alice(), 110);
+        gate.resume_batch_chained(vec![U64(0)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "batch must not be empty")]
+    fn batch_rejects_empty() {
+        let mut gate = init_with_relayer();
+        with_ctx(approver(), 110);
+        gate.resume_batch_chained(vec![]);
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown intent_id for first in batch")]
+    fn batch_rejects_unknown_first_id() {
+        let mut gate = init_with_relayer();
+        with_ctx(approver(), 110);
+        gate.resume_batch_chained(vec![U64(999)]);
+    }
+
+    #[test]
+    fn reset_batch_tail_clears_state() {
+        with_ctx(owner(), 100);
+        let mut gate = Gate::new(owner(), approver());
+        // Forcibly inject a stale tail to simulate mid-chain failure.
+        gate.batch_chain_tail = vec![7, 8, 9];
+        with_ctx(owner(), 101);
+        gate.reset_batch_tail();
+        assert!(gate.get_batch_tail().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "owner-only")]
+    fn reset_batch_tail_rejects_non_owner() {
+        with_ctx(owner(), 100);
+        let mut gate = Gate::new(owner(), approver());
+        with_ctx(approver(), 101);
+        gate.reset_batch_tail();
+    }
+
+    #[test]
+    #[should_panic(expected = "chain tail mismatch")]
+    fn continue_chain_detects_tail_mismatch() {
+        with_ctx(owner(), 100);
+        let mut gate = Gate::new(owner(), approver());
+        gate.batch_chain_tail = vec![3, 4];
+        // Simulate the private callback (testing_env! allows calling private fns
+        // because the contract's account is the predecessor by default).
+        testing_env!(VMContextBuilder::new()
+            .predecessor_account_id(env::current_account_id())
+            .block_index(102)
+            .build());
+        gate.continue_chain(U64(99), 1);
+    }
+
+    #[test]
+    fn get_batch_tail_roundtrips() {
+        with_ctx(owner(), 100);
+        let mut gate = Gate::new(owner(), approver());
+        gate.batch_chain_tail = vec![10, 20, 30];
+        assert_eq!(gate.get_batch_tail(), vec![U64(10), U64(20), U64(30)]);
     }
 }
